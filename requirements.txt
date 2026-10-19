@@ -1,0 +1,9 @@
+# Python 3.12+
+lighter-sdk==1.1.6
+hyperliquid-python-sdk==0.24.0
+eth-account>=0.13,<0.14
+websockets>=13,<18
+aiohttp>=3.9,<4
+PyYAML>=6.0
+python-dotenv>=1.0
+rich>=13.7

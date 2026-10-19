@@ -1,0 +1,10 @@
+*.lock
+*.pyc
+.env
+.pytest_cache/
+.venv/
+__pycache__/
+config/local*.yaml
+data/
+logs/
+venv/

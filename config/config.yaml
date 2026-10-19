@@ -1,0 +1,110 @@
+# lighter-robinhood-entropyIO-trading configuration
+#
+# Venue toggle: enable EXACTLY TWO venues to trade (live). The bot always arbitrages
+# one pair: maker (post-only) on one venue, IOC hedge (taker) on the other.
+#   lighter     = Lighter mainnet perps            (fees 0)
+#   lighter_rh  = Lighter on Robinhood Chain        (fees 0, chain id 466324)
+#   entropy     = Entropy, Hyperliquid HIP-3 dex "io" (io:OAI, io:ANTH, io:SNDK ...)
+# Override from the CLI without editing this file:  python -m arb live --venues lighter,entropy
+venues:
+  lighter:
+    enabled: true
+    maker_fee_pct: 0.0
+    taker_fee_pct: 0.0
+    requests_per_minute: 60
+  lighter_rh:
+    enabled: true
+    maker_fee_pct: 0.0
+    taker_fee_pct: 0.0
+    requests_per_minute: 60      # RH standard accounts: keep conservative
+  entropy:
+    enabled: false
+    dex: io
+    # Entropy base fees are maker 0.030% / taker 0.090%. Growth-mode markets (OAI, ANTH at launch)
+    # pay 10% of that: 0.003% / 0.009%. If a symbol is NOT in growth mode, set 0.03 / 0.09 here.
+    maker_fee_pct: 0.003
+    taker_fee_pct: 0.009
+    leverage: 3                  # isolated; OAI max 6x
+    requests_per_minute: 600
+
+# Who quotes (maker) in each pair. The other venue is the IOC taker / hedge leg.
+roles:
+  lighter+lighter_rh: lighter_rh
+  lighter+entropy: entropy
+  lighter_rh+entropy: entropy
+
+market_data:
+  watch_all_venues: true         # monitor shows all three pairs; only the enabled pair trades
+
+trading:
+  close_only: false
+  allow_preexisting_positions: false
+
+paths:
+  data_dir: data
+  log_dir: logs
+
+sampler_interval_s: 5
+ui_refresh_s: 1
+
+defaults:
+  strategy:
+    initial_threshold_pct: 0.30
+    grid_step_pct: 0.15
+    max_grids: 3
+    first_close_ratio: 0.5
+    grid_value_usdc: 200
+    order_value_usdc: 100
+  basis:
+    enabled: true
+    ema_seconds: 3600
+    warmup_seconds: 3600
+    drift_seconds: 3600
+    max_drift_pct: 0.30
+  execution:
+    maker_price_mode: join
+    maker_timeout_s: 20
+    hedge_slippage_pct: 0.05
+    hedge_max_attempts: 4
+    close_mode: maker_taker
+  risk:
+    min_available_usdc: 100
+    max_symbol_value_usdc: 600
+    max_venue_notional_usdc: 2000
+
+# symbol key -> market name on each venue. A symbol trades on a pair only if both venues list it.
+symbols:
+  OPENAI:
+    venues: {lighter: OPENAI, lighter_rh: OPENAI, entropy: "io:OAI"}
+  ANTHROPIC:
+    venues: {lighter: ANTHROPIC, lighter_rh: ANTHROPIC, entropy: "io:ANTH"}
+  SNDK:
+    venues: {lighter: SNDK, lighter_rh: SNDK, entropy: "io:SNDK"}
+    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+  MU:
+    venues: {lighter: MU, lighter_rh: MU}
+    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+  AMD:
+    venues: {lighter: AMD, lighter_rh: AMD}
+    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+  NVDA:
+    venues: {lighter: NVDA, lighter_rh: NVDA}
+    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+  INTC:
+    venues: {lighter: INTC, lighter_rh: INTC}
+    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+  SPCX:
+    venues: {lighter: SPCX, lighter_rh: SPCX}
+    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+  BTC:
+    venues: {lighter: BTC, lighter_rh: BTC}
+    strategy: {initial_threshold_pct: 0.15, grid_step_pct: 0.08}
+  ETH:
+    venues: {lighter: ETH, lighter_rh: ETH}
+    strategy: {initial_threshold_pct: 0.15, grid_step_pct: 0.08}
+  SOL:
+    venues: {lighter: SOL, lighter_rh: SOL}
+    strategy: {initial_threshold_pct: 0.20, grid_step_pct: 0.10}
+  HYPE:
+    venues: {lighter: HYPE, lighter_rh: HYPE}
+    strategy: {initial_threshold_pct: 0.20, grid_step_pct: 0.10}
