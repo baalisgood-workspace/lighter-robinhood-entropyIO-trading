@@ -17,11 +17,11 @@ from decimal import Decimal
 from typing import Any, Optional
 
 import aiohttp
-import websockets
 
 from arb.models import Balance, Level, MarketInfo, OrderBook, OrderState, OrderStatus, Position
 from arb.util import D, RateLimiter, new_client_index
 from arb.venues.base import Venue, VenueError
+from arb.venues.transport import harden_foreign_session, http_session, ws_connect
 
 log = logging.getLogger("arb.lighter")
 
@@ -67,6 +67,7 @@ class _RawBook:
 class LighterVenue(Venue):
     def __init__(self, cfg, env=None):
         super().__init__(cfg, env)
+        self._write_lock = asyncio.Lock()  # one signed tx at a time per account (nonce order)
         p = cfg.env_prefix
         self.account_index = (self.env.get(f"{p}_ACCOUNT_INDEX") or "").strip()
         self.api_key_index = (self.env.get(f"{p}_API_KEY_INDEX") or "").strip()
@@ -94,7 +95,7 @@ class LighterVenue(Venue):
 
     async def start(self, symbols: list[str], trading: bool) -> None:
         self._running = True
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        self._session = http_session(15)
         await self._load_markets(symbols)
         if trading:
             if not self.has_credentials():
@@ -110,6 +111,9 @@ class LighterVenue(Venue):
                 api_private_keys={key_index: self._api_private_key},
                 chain_id=self.cfg.chain_id,
             )
+            rc = getattr(getattr(self.signer, "api_client", None), "rest_client", None)
+            if rc is not None and getattr(rc, "pool_manager", None) is not None:
+                harden_foreign_session(rc.pool_manager)  # signed tx must never follow a redirect
             err = self.signer.check_client()
             if err is not None:
                 raise VenueError(f"{self.name}: API key check failed: {err}")
@@ -139,7 +143,7 @@ class LighterVenue(Venue):
     async def _get(self, path: str, params: Optional[dict] = None, cost: float = 1.0) -> Any:
         await self.limiter.acquire(cost)
         assert self._session is not None
-        async with self._session.get(self.cfg.rest_url.rstrip("/") + path, params=params) as r:
+        async with self._session.get(self.cfg.rest_url.rstrip("/") + path, params=params, allow_redirects=False) as r:
             text = await r.text()
             if r.status != 200:
                 raise VenueError(f"{self.name} GET {path} -> HTTP {r.status}: {text[:200]}")
@@ -210,12 +214,12 @@ class LighterVenue(Venue):
         backoff = 1.0
         while self._running:
             try:
-                async with websockets.connect(self._public_url(), ping_interval=None, max_size=None, open_timeout=15) as ws:
+                async with ws_connect(self._public_url(), self.mark_alive, self.cfg.liveness_s, self.cfg.quick_resume_s) as ws:
                     self._public_ws = ws
                     for mid in self._symbol_by_mid:
                         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{mid}"}))
                         await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{mid}"}))
-                    self.connected = True
+                    self.on_connected()
                     backoff = 1.0
                     last_ping = time.monotonic()
                     while self._running:
@@ -234,11 +238,12 @@ class LighterVenue(Venue):
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("%s public WS error: %s; reconnect in %.0fs", self.name, exc, backoff)
+                self.alarm("connection_timeout" if "ping" in str(exc).lower() or "timeout" in str(exc).lower() else "reconnect",
+                           detail=str(exc))
             self.connected = False
             self._public_ws = None
             self._raw.clear()
-            self.books.clear()
-            self.market_event.set()
+            self.reset_books()
             if self._running:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
@@ -261,7 +266,8 @@ class LighterVenue(Venue):
             elif ob.get("begin_nonce") is not None and book.nonce is not None and int(ob["begin_nonce"]) != book.nonce:
                 log.info("%s order book gap on market %s, resubscribing", self.name, mid)
                 self._raw.pop(mid, None)
-                self.books.pop(self._symbol_by_mid.get(mid, ""), None)
+                self.reset_books([self._symbol_by_mid.get(mid, "")])
+                self.alarm("sequence_gap", self._symbol_by_mid.get(mid, ""), f"begin_nonce {ob['begin_nonce']} != {book.nonce}")
                 await ws.send(json.dumps({"type": "unsubscribe", "channel": f"order_book/{mid}"}))
                 await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{mid}"}))
                 return
@@ -306,7 +312,7 @@ class LighterVenue(Venue):
         while self._running:
             try:
                 token = self._auth_token()
-                async with websockets.connect(self.cfg.ws_url, ping_interval=None, max_size=None, open_timeout=15) as ws:
+                async with ws_connect(self.cfg.ws_url, lambda: None, self.cfg.liveness_s * 2, self.cfg.quick_resume_s) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "channel": f"account_all_orders/{acct}", "auth": token}))
                     self.private_connected = True
                     backoff = 1.0
@@ -370,11 +376,16 @@ class LighterVenue(Venue):
         self._track(st)
         await self.limiter.acquire()
         try:
-            _tx, resp, err = await self.signer.create_order(
-                market_index=mid, client_order_index=int(st.client_id), base_amount=base, price=px,
-                is_ask=not st.is_buy, order_type=order_type, time_in_force=tif,
-                reduce_only=st.reduce_only, order_expiry=expiry,
-            )
+            async with self._write_lock:
+                # pre-sign guard: a maker order must not be signed after the market-data stream dropped
+                if st.post_only and not self.connected:
+                    st.apply(status=OrderStatus.REJECTED, reason="market data disconnected at sign time")
+                    return st
+                _tx, resp, err = await self.signer.create_order(
+                    market_index=mid, client_order_index=int(st.client_id), base_amount=base, price=px,
+                    is_ask=not st.is_buy, order_type=order_type, time_in_force=tif,
+                    reduce_only=st.reduce_only, order_expiry=expiry,
+                )
         except Exception as exc:  # noqa: BLE001 - network: state unknown, must be resolved by refresh
             st.apply(status=OrderStatus.UNKNOWN, reason=f"submit exception: {exc}")
             log.error("%s submit exception (state unknown) %s: %s", self.name, st.client_id, exc)
@@ -452,7 +463,8 @@ class LighterVenue(Venue):
         if not st.exchange_id:
             raise VenueError(f"{self.name}: cannot cancel {st.client_id}, exchange order index unknown")
         await self.limiter.acquire()
-        _tx, resp, err = await self.signer.cancel_order(market_index=self.market(st.symbol).extra["market_id"], order_index=int(st.exchange_id))
+        async with self._write_lock:
+            _tx, resp, err = await self.signer.cancel_order(market_index=self.market(st.symbol).extra["market_id"], order_index=int(st.exchange_id))
         if err is not None:
             log.warning("%s cancel %s returned: %s", self.name, st.client_id, err)
 

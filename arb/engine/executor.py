@@ -6,9 +6,20 @@
 3. The maker order is cancelled on timeout, when the edge at our resting price
    falls below the requirement minus `cancel_adverse_pct`, when the taker book
    goes stale, or re-quoted when someone improves the best price.
-4. If hedging fails after all attempts the filled maker quantity is unwound on
-   the maker venue (IOC) when `emergency_unwind` is enabled; whatever cannot be
-   resolved is reported so the engine halts.
+4. If hedging fails after all attempts (only confirmed zero-fill IOCs use up the
+   retry budget) the slice reports an unresolved exposure: the engine cancels all
+   makers and locks the instance for manual intervention. With `emergency_unwind`
+   the filled maker quantity is first flattened on the maker venue (IOC).
+
+maker_price_mode=threshold (ported from arcus-maker-lighter-taker): the maker
+order rests at the exact price that yields the required basis-adjusted edge (and
+the close-profit floor) against the taker book, clamped to the nearest passive
+tick; it is re-priced when that fair price moves more than
+`requote_threshold_pct` or the order is older than `max_order_age_s`, at most
+`max_requotes_per_s` times per second (risk cancels bypass the limit).
+Partial maker fills are accumulated until the hedge reaches the venue minimums
+and `hedge_min_notional_usdc`; smaller dust is carried into the next slice of the
+same direction (`ExecPlan.carry_in`).
 """
 from __future__ import annotations
 
@@ -44,6 +55,9 @@ class ExecPlan:
     required_dev: float  # execute while dev(direction) >= required_dev
     basis_fn: Callable[[], float]
     taker_taker: bool = False
+    required_raw: Optional[float] = None  # close-profit floor on the RAW (not basis-adjusted) edge
+    carry_in: Decimal = ZERO  # earlier unhedged maker dust of the same sign, hedged together with this slice
+    target: Optional[Decimal] = None
 
     @property
     def reduce_only(self) -> bool:
@@ -62,6 +76,10 @@ class ExecResult:
     note: str = ""
     error: str = ""
     halted: bool = False
+    carry_in: Decimal = ZERO
+    hedge_orders: int = 0
+    zero_fill_hedges: int = 0
+    requotes: int = 0
     events: list[str] = field(default_factory=list)
 
     @property
@@ -78,7 +96,7 @@ class ExecResult:
 
     @property
     def hedged(self) -> Decimal:
-        return min(self.maker_net, self.taker_filled)
+        return min(self.maker_net + self.carry_in, self.taker_filled)
 
     def realized_dev(self, direction: str, basis: float) -> Optional[float]:
         if self.maker_avg is None or self.taker_avg is None:
@@ -103,15 +121,53 @@ class Executor:
             return None
         return b
 
-    def _edge_at(self, plan: ExecPlan, maker_px: Decimal, qty: Decimal) -> Optional[float]:
+    def _hedge_ok(self, plan: ExecPlan, qty: Decimal, px: Decimal) -> bool:
+        T = self.venues[plan.pair.taker]
+        return self._tradable(T, plan.taker_sym, qty, px) and qty * px >= Decimal(str(plan.sym.execution.hedge_min_notional_usdc))
+
+    def _taker_vwap(self, plan: ExecPlan, qty: Decimal) -> Optional[Decimal]:
         rk = plan.sym.risk
         tb = self._fresh(self.venues[plan.pair.taker], plan.taker_sym, rk.max_quote_age_s)
         if tb is None:
             return None
         f = sg.taker_fill(tb, not sg.maker_is_buy(plan.direction), qty, rk.depth_levels, rk.depth_band_pct)
-        if f is None:
+        return f.vwap if f else None
+
+    def _edge_at(self, plan: ExecPlan, maker_px: Decimal, qty: Decimal) -> Optional[float]:
+        """Basis-adjusted edge at maker_px, or -inf when the raw close-profit floor is violated."""
+        vwap = self._taker_vwap(plan, qty)
+        if vwap is None:
             return None
-        return sg.adjusted_edge(plan.direction, sg.raw_edge(plan.direction, maker_px, f.vwap), plan.basis_fn())
+        raw = sg.raw_edge(plan.direction, maker_px, vwap)
+        if plan.required_raw is not None and raw < plan.required_raw - 1e-9:
+            return float("-inf")
+        return sg.adjusted_edge(plan.direction, raw, plan.basis_fn())
+
+    def _required_raw(self, plan: ExecPlan) -> float:
+        b = plan.basis_fn()
+        need = plan.required_dev + b if plan.direction == sg.SELL_MAKER else plan.required_dev - b
+        return max(need, plan.required_raw) if plan.required_raw is not None else need
+
+    def threshold_price(self, plan: ExecPlan, qty: Decimal) -> Optional[Decimal]:
+        """Passive maker price that exactly meets the required edge vs the current taker VWAP."""
+        M = self.venues[plan.pair.maker]
+        mbook = self._fresh(M, plan.maker_sym, plan.sym.risk.max_quote_age_s)
+        vwap = self._taker_vwap(plan, qty)
+        if mbook is None or vwap is None or not mbook.best_bid or not mbook.best_ask:
+            return None
+        r = Decimal(str(self._required_raw(plan))) / 100
+        mb = sg.maker_is_buy(plan.direction)
+        if mb:
+            px = M.round_price(plan.maker_sym, vwap / (1 + r), up=False)
+            ceiling = mbook.best_ask.price - M.price_tick_at(plan.maker_sym, mbook.best_ask.price)
+            if px > ceiling:
+                px = M.round_price(plan.maker_sym, ceiling, up=False)
+        else:
+            px = M.round_price(plan.maker_sym, vwap * (1 + r), up=True)
+            floor = mbook.best_bid.price + M.price_tick_at(plan.maker_sym, mbook.best_bid.price)
+            if px < floor:
+                px = M.round_price(plan.maker_sym, floor, up=True)
+        return px if px > 0 else None
 
     # ---------------------------------------------------------------- hedge
     async def _ioc(self, v: Venue, sym: str, is_buy: bool, qty: Decimal, reduce_only: bool,
@@ -133,14 +189,20 @@ class Executor:
         taker_buy = not sg.maker_is_buy(plan.direction)
         remaining = T.round_qty(plan.taker_sym, qty)
         dust = qty - remaining
-        for attempt in range(ex.hedge_max_attempts):
-            if remaining <= 0:
-                break
+        zero = orders = stale = 0
+        # retry budget: only confirmed zero-filled terminal IOCs count; positive partials keep going
+        while remaining > 0 and zero < ex.hedge_max_attempts and orders < ex.hedge_max_orders:
             st = await self._ioc(T, plan.taker_sym, taker_buy, remaining, plan.reduce_only,
-                                 ex.hedge_slippage_pct + attempt * ex.hedge_slippage_step_pct, plan.sym.risk.max_quote_age_s)
-            if st is None:
+                                 ex.hedge_slippage_pct + zero * ex.hedge_slippage_step_pct, plan.sym.risk.max_quote_age_s)
+            if st is None:  # taker book stale: nothing was sent
+                stale += 1
+                if stale > 20:
+                    res.events.append("hedge: taker book stale")
+                    break
                 await asyncio.sleep(0.3)
                 continue
+            orders += 1
+            res.hedge_orders += 1
             if st.status == OrderStatus.UNKNOWN:
                 res.halted = True
                 res.error = f"hedge order {st.client_id} on {T.name} has unknown outcome"
@@ -149,6 +211,9 @@ class Executor:
                 res.taker_filled += st.filled
                 res.taker_cost += st.filled * (st.avg_price or st.price)
                 remaining -= st.filled
+            else:
+                zero += 1
+                res.zero_fill_hedges += 1
             if st.status == OrderStatus.REJECTED:
                 res.events.append(f"hedge rejected: {st.reason[:120]}")
             ref = T.book(plan.taker_sym)
@@ -192,7 +257,8 @@ class Executor:
                 res.error = f"unhedged {left} {plan.maker_sym} on {M.name} after emergency unwind"
         else:
             res.halted = True
-            res.error = f"unhedged {unhedged} {plan.maker_sym} on {M.name} (emergency_unwind disabled)"
+            res.error = (f"unhedged {unhedged} {plan.maker_sym} on {M.name} after {res.zero_fill_hedges} zero-fill hedges "
+                         f"- manual intervention required")
 
     # ---------------------------------------------------------------- main
     async def run(self, plan: ExecPlan) -> ExecResult:
@@ -224,23 +290,29 @@ class Executor:
             raise ExecutionHalt(f"IOC {st.client_id} on {M.name} has unknown outcome")
         res.maker_filled += st.filled
         res.maker_cost += st.filled * (st.avg_price or st.price)
+        res.carry_in = plan.carry_in
         if st.filled > 0:
-            left = await self._hedge(plan, st.filled, res)
+            left = await self._hedge(plan, st.filled + plan.carry_in, res)
             await self._settle_unhedged(plan, left, res)
 
     async def _run_maker_taker(self, plan: ExecPlan, res: ExecResult) -> None:
         M, T = self.venues[plan.pair.maker], self.venues[plan.pair.taker]
         ex, rk = plan.sym.execution, plan.sym.risk
         mb = sg.maker_is_buy(plan.direction)
+        thr = ex.maker_price_mode == "threshold"
         loop = asyncio.get_running_loop()
         start = loop.time()
         deadline = start + ex.maker_timeout_s
+        min_gap = 1.0 / ex.max_requotes_per_s
         requotes = 0
-        pending = ZERO  # maker fills not yet hedged
+        res.carry_in = plan.carry_in
+        pending = plan.carry_in  # maker fills (plus carried dust) not yet hedged
         order: Optional[OrderState] = None
         seen = ZERO
         seen_cost = ZERO
         placed_at = 0.0
+        last_replace = -1e9
+        anchor: Optional[Decimal] = None  # threshold mode: fair price the resting order was placed at
         stop_reason = ""
         last_refresh = 0.0
 
@@ -261,21 +333,25 @@ class Executor:
                     await M.cancel(o)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("cancel failed: %s", exc)
+                # a replacement is only placed after the cancel reached a terminal state
                 await M.wait_final(o, ex.order_final_timeout_s, poll=ex.order_poll_interval_s)
             absorb(o)
             if not o.status.final:
                 raise ExecutionHalt(f"maker order {o.client_id} on {M.name} not final after cancel ({o.status.value})")
             M.forget(o)
 
-        async def hedge_pending(force: bool) -> None:
+        def ref_px() -> Decimal:
+            tb = T.book(plan.taker_sym)
+            return (tb.mid if tb and tb.mid else None) or (order.price if order else Decimal("1"))
+
+        async def hedge_pending() -> None:
             nonlocal pending
             if pending <= 0:
                 return
-            tb = T.book(plan.taker_sym)
-            px = (tb.mid if tb and tb.mid else None) or (order.price if order else Decimal("1"))
+            px = ref_px()
             q = T.round_qty(plan.taker_sym, pending)
-            if q <= 0 or not self._tradable(T, plan.taker_sym, q, px):
-                return  # wait for more fills (or leave as residual at the end)
+            if q <= 0 or not self._hedge_ok(plan, q, px):
+                return  # accumulate more fills (dust policy); leftovers become carried residual
             before = res.taker_filled
             left = await self._hedge(plan, q, res)
             pending -= (res.taker_filled - before)
@@ -286,6 +362,16 @@ class Executor:
                     raise ExecutionHalt(res.error)
                 raise _StopSlice("hedge failed")
 
+        def price_now(remaining: Decimal) -> Optional[Decimal]:
+            if thr:
+                return self.threshold_price(plan, remaining)
+            mbook = self._fresh(M, plan.maker_sym, rk.max_quote_age_s)
+            if mbook is None:
+                return None
+            ref = mbook.best_bid.price if mb else mbook.best_ask.price
+            px = sg.maker_quote(mbook, mb, ex.maker_price_mode, M.price_tick_at(plan.maker_sym, ref))
+            return None if px is None else M.round_price(plan.maker_sym, px, up=not mb)  # never more aggressive
+
         try:
             while True:
                 now = loop.time()
@@ -294,29 +380,32 @@ class Executor:
                     if self.stop_flag():
                         stop_reason = "stopping"
                         break
-                    if now >= deadline or requotes > ex.max_requotes:
+                    if now >= deadline or (not thr and requotes > ex.max_requotes):
                         stop_reason = "timeout" if now >= deadline else "max requotes"
                         break
-                    mbook = self._fresh(M, plan.maker_sym, rk.max_quote_age_s)
-                    if mbook is None:
+                    if self._fresh(M, plan.maker_sym, rk.max_quote_age_s) is None:
                         stop_reason = "maker book stale"
                         break
-                    ref = mbook.best_bid.price if mb else mbook.best_ask.price
-                    tick = M.price_tick_at(plan.maker_sym, ref)
-                    px = sg.maker_quote(mbook, mb, ex.maker_price_mode, tick)
-                    if px is None or remaining <= 0 or not self._tradable(M, plan.maker_sym, remaining, px):
-                        stop_reason = "nothing left" if remaining <= 0 else "below min size"
+                    if remaining <= 0:
+                        stop_reason = "nothing left"
                         break
-                    px = M.round_price(plan.maker_sym, px, up=not mb)  # never more aggressive
+                    px = price_now(remaining)
+                    if px is None or not self._tradable(M, plan.maker_sym, remaining, px):
+                        stop_reason = "below min size" if px is not None else "taker depth/stale"
+                        break
                     edge = self._edge_at(plan, px, remaining)
-                    if edge is None or edge < plan.required_dev:
+                    if edge is None or edge < plan.required_dev - 1e-9:
                         stop_reason = "edge gone" if edge is not None else "taker depth/stale"
                         break
+                    wait = last_replace + min_gap - loop.time()
+                    if wait > 0:  # replacement rate limit per symbol
+                        await asyncio.sleep(wait)
                     order = await M.place_post_only(plan.maker_sym, mb, remaining, px, plan.reduce_only)
                     res.orders_placed += 1
                     seen = ZERO
                     seen_cost = ZERO
-                    placed_at = loop.time()
+                    placed_at = last_replace = loop.time()
+                    anchor = px
                     if order.status == OrderStatus.REJECTED:
                         res.events.append(f"maker rejected: {order.reason[:120]}")
                         M.forget(order)
@@ -330,7 +419,7 @@ class Executor:
                             raise ExecutionHalt(f"maker order {order.client_id} on {M.name} outcome unknown")
                     continue
 
-                got = await M.wait_order(order, ex.order_poll_interval_s)
+                got = await M.wait_order(order, min(ex.order_poll_interval_s, 0.2) if thr else ex.order_poll_interval_s)
                 now = loop.time()
                 private_ok = getattr(M, "private_connected", True) and M.connected
                 if not got and (not private_ok or now - last_refresh > 5 * ex.order_poll_interval_s):
@@ -340,7 +429,7 @@ class Executor:
                     except Exception as exc:  # noqa: BLE001
                         log.debug("refresh failed: %s", exc)
                 absorb(order)
-                await hedge_pending(force=False)
+                await hedge_pending()
 
                 if order.status.final:
                     M.forget(order)
@@ -349,20 +438,29 @@ class Executor:
                     order = None
                     continue
 
-                # ---------- cancel / requote conditions
+                # ---------- cancel / requote conditions (risk cancels bypass the replacement throttle)
                 cancel_reason = ""
+                throttled = now - last_replace < min_gap
                 if self.stop_flag():
                     cancel_reason = "stopping"
                 elif now >= deadline:
                     cancel_reason = "timeout"
+                elif self._fresh(M, plan.maker_sym, rk.max_quote_age_s) is None:
+                    cancel_reason = "maker book stale"
                 else:
                     rem = max(order.remaining, M.market(plan.maker_sym).min_qty)
                     edge = self._edge_at(plan, order.price, rem)
                     if edge is None:
                         cancel_reason = "taker depth/stale"
                     elif edge < plan.required_dev - ex.cancel_adverse_pct:
-                        cancel_reason = f"adverse ({edge:.3f}% < {plan.required_dev - ex.cancel_adverse_pct:.3f}%)"
-                    elif ex.requote_when_not_best and now - placed_at >= ex.requote_min_interval_s:
+                        # threshold mode re-prices at once (risk cancel, not throttled); other modes stop the slice
+                        cancel_reason = "requote" if thr else f"adverse ({edge:.3f}% < {plan.required_dev - ex.cancel_adverse_pct:.3f}%)"
+                    elif thr and not throttled:
+                        fair = self.threshold_price(plan, rem)
+                        moved = fair is not None and anchor and abs(fair / anchor - 1) * 100 > Decimal(str(ex.requote_threshold_pct))
+                        if moved or now - placed_at >= ex.max_order_age_s or (edge < plan.required_dev - 1e-9):
+                            cancel_reason = "requote"
+                    elif not thr and ex.requote_when_not_best and not throttled and now - placed_at >= ex.requote_min_interval_s:
                         mbook = self._fresh(M, plan.maker_sym, rk.max_quote_age_s)
                         if mbook is not None:
                             best = mbook.best_bid.price if mb else mbook.best_ask.price
@@ -370,10 +468,11 @@ class Executor:
                                 cancel_reason = "requote"
                 if cancel_reason:
                     await finalize(order)
-                    await hedge_pending(force=True)
+                    await hedge_pending()
                     order = None
                     if cancel_reason == "requote":
                         requotes += 1
+                        res.requotes += 1
                         continue
                     stop_reason = cancel_reason
                     break
@@ -382,11 +481,10 @@ class Executor:
         finally:
             if order is not None and not order.status.final:
                 await finalize(order)
-        # final hedge of whatever is still pending
+        # final hedge of whatever is still pending (dust below the hedge minimum stays as carried residual)
         if pending > 0:
-            tb = T.book(plan.taker_sym)
-            px = (tb.mid if tb and tb.mid else None) or Decimal("1")
-            if self._tradable(T, plan.taker_sym, T.round_qty(plan.taker_sym, pending), px):
+            px = ref_px()
+            if self._hedge_ok(plan, T.round_qty(plan.taker_sym, pending), px):
                 before = res.taker_filled
                 left = await self._hedge(plan, pending, res)
                 pending -= res.taker_filled - before

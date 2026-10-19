@@ -27,11 +27,11 @@ from decimal import Decimal
 from typing import Any, Optional
 
 import aiohttp
-import websockets
 
 from arb.models import Balance, Level, MarketInfo, OrderBook, OrderState, OrderStatus, Position
 from arb.util import D, RateLimiter, new_client_index, round_to_step
 from arb.venues.base import Venue, VenueError
+from arb.venues.transport import http_session, ws_connect
 
 log = logging.getLogger("arb.arcus")
 
@@ -118,7 +118,7 @@ class ArcusVenue(Venue):
 
     async def start(self, symbols: list[str], trading: bool) -> None:
         self._running = True
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        self._session = http_session(15)
         await self._load_markets(symbols)
         self._watch = [s for s in symbols if s in self.markets]
         if trading:
@@ -151,14 +151,21 @@ class ArcusVenue(Venue):
             headers.update({"X-Timestamp": str(nonce), "X-Signature": signature})
         await self.limiter.acquire()
         try:
-            async with self._session.request(method, self.cfg.rest_url + path, params=query, json=body, headers=headers) as r:
+            async with self._session.request(method, self.cfg.rest_url + path, params=query, json=body, headers=headers,
+                                             allow_redirects=False) as r:
                 text = await r.text()
+                if 300 <= r.status < 400:  # never follow: a redirected write has an unknown outcome
+                    if method != "GET":
+                        raise ArcusUnknown(f"arcus HTTP {r.status} redirect refused")
+                    raise VenueError(f"arcus HTTP {r.status} redirect refused")
                 if r.status >= 400:
                     if method != "GET" and r.status not in (400, 401, 403, 429):
                         raise ArcusUnknown(f"arcus HTTP {r.status}: {text[:200]}")
                     raise ArcusRejected(f"arcus HTTP {r.status}: {text[:200]}")
                 return json.loads(text) if text else {}
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
+            if isinstance(exc, VenueError):
+                raise
             if method != "GET":
                 raise ArcusUnknown(f"arcus transport error: {exc}") from exc
             raise VenueError(f"arcus read failed: {exc}") from exc
@@ -229,7 +236,7 @@ class ArcusVenue(Venue):
         backoff = 1.0
         while self._running:
             try:
-                async with websockets.connect(self.cfg.ws_url, ping_interval=20, ping_timeout=20, max_size=None, open_timeout=15) as ws:
+                async with ws_connect(self.cfg.ws_url, self.mark_alive, self.cfg.liveness_s, self.cfg.quick_resume_s) as ws:
                     self._seq.clear()
                     for sym in self._watch:
                         await ws.send(json.dumps({"type": "subscribe", "channel": "l2Orderbook", "id": sym, "nLevels": BOOK_DEPTH}))
@@ -239,23 +246,23 @@ class ArcusVenue(Venue):
                             await ws.send(json.dumps({"type": "subscribe", "channel": ch, "id": self.address,
                                                       "accountIndex": self.account_index}))
                         asyncio.create_task(self._refresh_open_orders())
-                    self.connected = True
+                    self.on_connected()
                     backoff = 1.0
                     while self._running:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=30)
                         except asyncio.TimeoutError:
                             raise VenueError("arcus WS silent for 30s")
-                        self.alive_ts = time.time()
                         self._on_ws(json.loads(raw))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("arcus WS error: %s; reconnect in %.0fs", exc, backoff)
+                self.alarm("connection_timeout" if "ping" in str(exc).lower() or "silent" in str(exc).lower() else "reconnect",
+                           detail=str(exc))
             self.connected = False
             self.private_connected = False
-            self.books.clear()
-            self.market_event.set()
+            self.reset_books()
             if self._running:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
@@ -264,7 +271,8 @@ class ArcusVenue(Venue):
         typ, ch, data = m.get("type"), m.get("channel"), m.get("contents")
         if typ == "degraded":
             if ch == "l2Orderbook" and m.get("id") in self.books:
-                self.books.pop(m["id"], None)  # wait for a fresh snapshot
+                self.reset_books([m["id"]])  # wait for a fresh snapshot
+                self.alarm("degraded", m["id"])
             if ch in ("orders", "userFills"):
                 self.private_connected = False
             return
@@ -387,6 +395,11 @@ class ArcusVenue(Venue):
             return st
         self._track(st)
         async with self._write_lock:
+            # readiness re-check after waiting for the write lock, right before signing
+            if not self.connected or not self.trading:
+                st.apply(status=OrderStatus.REJECTED, reason="arcus not ready (disconnected) at sign time")
+                return st
+            self._check_market(st.symbol)
             nonce = self._nonce()
             expiry = nonce // 1000 + 32 * 24 * 3600 * 1_000_000  # microseconds
             payload = {"ad": self.address, "ai": self.account_index, "c": st.client_id, "ct": nonce, "g": expiry * 1000,

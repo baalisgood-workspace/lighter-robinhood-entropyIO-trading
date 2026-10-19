@@ -29,8 +29,11 @@ def build_view(eng: Engine):
     mode = "LIVE" if eng.live else "MONITOR"
     act = f"{eng.active.maker} maker -> {eng.active.taker} taker" if eng.active else "no active pair (monitor only)"
     head = Text(f"[{mode}] active: {act}   close_only={eng.cfg.close_only}   up {int(now - eng.started)}s", style="bold")
+    if eng.live:
+        head.append(f"   slices {len([t for t in eng.exec_tasks.values() if not t.done()])}/{eng.cfg.max_parallel_slices}"
+                    + ("   reconciling" if eng.reconcile_due else ""))
     if eng.halted:
-        head.append(f"\nHALTED: {eng.halted}", style="bold red")
+        head.append(f"\nHALTED (manual intervention, see {eng.lock_path}): {eng.halted}", style="bold red")
 
     vt = Table(title="venues", expand=False)
     for col in ("venue", "enabled", "conn", "trading", "books", "equity", "available"):

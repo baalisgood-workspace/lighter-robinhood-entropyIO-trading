@@ -20,11 +20,11 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any, Optional
 
 import aiohttp
-import websockets
 
 from arb.models import Balance, Level, MarketInfo, OrderBook, OrderState, OrderStatus, Position
 from arb.util import D, RateLimiter, new_client_index
 from arb.venues.base import Venue, VenueError
+from arb.venues.transport import harden_requests_session, http_session, ws_connect
 
 log = logging.getLogger("arb.entropy")
 
@@ -88,7 +88,7 @@ class EntropyVenue(Venue):
     # ------------------------------------------------------------ lifecycle
     async def start(self, symbols: list[str], trading: bool) -> None:
         self._running = True
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        self._session = http_session(15)
         await self._load_markets(symbols)
         if trading:
             if not self.has_credentials():
@@ -107,6 +107,8 @@ class EntropyVenue(Venue):
 
         wallet = Account.from_key(self._private_key)
         ex = Exchange(wallet, self.cfg.rest_url, account_address=self.address, perp_dexs=[self.dex])
+        harden_requests_session(getattr(ex, "session", None))  # signed actions never follow redirects
+        harden_requests_session(getattr(getattr(ex, "info", None), "session", None))
         for sym in self.markets:
             if sym not in ex.info.name_to_coin:
                 raise VenueError(f"entropy: SDK does not know {sym}")
@@ -136,7 +138,7 @@ class EntropyVenue(Venue):
     async def _info(self, payload: dict, cost: float = 1.0) -> Any:
         await self.limiter.acquire(cost)
         assert self._session is not None
-        async with self._session.post(self.cfg.rest_url.rstrip("/") + "/info", json=payload) as r:
+        async with self._session.post(self.cfg.rest_url.rstrip("/") + "/info", json=payload, allow_redirects=False) as r:
             text = await r.text()
             if r.status != 200:
                 raise VenueError(f"entropy /info {payload.get('type')} -> HTTP {r.status}: {text[:200]}")
@@ -202,14 +204,14 @@ class EntropyVenue(Venue):
         backoff = 1.0
         while self._running:
             try:
-                async with websockets.connect(self.cfg.ws_url, ping_interval=None, max_size=None, open_timeout=15) as ws:
+                async with ws_connect(self.cfg.ws_url, self.mark_alive, self.cfg.liveness_s, self.cfg.quick_resume_s) as ws:
                     for sym in self.markets:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": sym}}))
                     if self.trading:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "orderUpdates", "user": self.address}}))
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "userFills", "user": self.address}}))
                         asyncio.create_task(self._refresh_open_orders())
-                    self.connected = True
+                    self.on_connected()
                     backoff = 1.0
                     last_ping = time.monotonic()
                     while self._running:
@@ -228,9 +230,10 @@ class EntropyVenue(Venue):
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("entropy WS error: %s; reconnect in %.0fs", exc, backoff)
+                self.alarm("connection_timeout" if "ping" in str(exc).lower() or "timeout" in str(exc).lower() else "reconnect",
+                           detail=str(exc))
             self.connected = False
-            self.books.clear()
-            self.market_event.set()
+            self.reset_books()
             if self._running:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)

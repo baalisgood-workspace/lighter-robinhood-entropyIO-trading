@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from arb.config import VENUE_NAMES, AppConfig, ConfigError, effective_t1, load_config
@@ -233,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
     lv.add_argument("--yes", action="store_true", help="skip interactive confirmation")
     lv.add_argument("--no-ui", action="store_true")
     common(sub.add_parser("positions", help="show exchange balances/positions and local state"))
+    ul = common(sub.add_parser("unlock", help="clear the manual-intervention lock of a pair after you fixed it"))
+    ul.add_argument("--yes", action="store_true")
     r = sub.add_parser("report", help="spread statistics from recorded samples")
     r.add_argument("--threshold", type=float, default=0.30)
     r.add_argument("--days", help="comma list of YYYY-MM-DD")
@@ -248,9 +251,27 @@ def main(argv: list[str] | None = None) -> int:
         print(describe(cfg))
         return 0
     if args.cmd == "report":
-        from arb.report import print_report
+        from arb.report import print_report, print_trades
         days = args.days.split(",") if args.days else None
-        return print_report(Path(cfg.data_dir), args.threshold, days)
+        rc = print_report(Path(cfg.data_dir), args.threshold, days)
+        print_trades(Path(cfg.data_dir))
+        return rc
+    if args.cmd == "unlock":
+        try:
+            lock = instance_dir(cfg, True) / "MANUAL_INTERVENTION.json"
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return 2
+        if not lock.exists():
+            print(f"no lock at {lock}")
+            return 0
+        print(lock.read_text())
+        if not args.yes and input("Positions verified/fixed on both venues and in positions.json? type 'yes': ").strip() != "yes":
+            print("aborted")
+            return 1
+        lock.rename(lock.with_name(f"MANUAL_INTERVENTION.resolved-{int(time.time())}.json"))
+        print("lock cleared")
+        return 0
 
     from arb.util import setup_logging
     use_ui = args.cmd in ("monitor", "live") and not args.no_ui and sys.stdout.isatty()

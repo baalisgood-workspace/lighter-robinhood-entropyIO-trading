@@ -36,7 +36,39 @@ class Venue(ABC):
         self._order_events: dict[str, asyncio.Event] = {}
         self.trading = False
         self.connected = False
-        self.alive_ts = 0.0  # wall time of the last message on the public market-data stream
+        self.alive_ts = 0.0  # wall time of the last frame (incl. ping/pong) on the public market-data stream
+        self.generation = 0  # incremented on every market-data (re)connect
+        self.book_epoch: dict[str, int] = {}  # per-symbol: bumped whenever a book is invalidated
+        self.alarms: list[dict] = []  # market-health alarms drained by the engine (journal)
+
+    # ------------------------------------------------------------ liveness / health
+    def mark_alive(self) -> None:
+        self.alive_ts = time.time()
+
+    def on_connected(self) -> None:
+        self.generation += 1
+        self.alive_ts = time.time()
+        self.connected = True
+        if self.generation > 1:
+            self.alarm("reconnect")
+
+    def alarm(self, kind: str, symbol: str = "", detail: str = "") -> None:
+        """kind: connection_timeout | sequence_gap | generation_change | reconnect | degraded"""
+        if len(self.alarms) < 1000:
+            self.alarms.append({"ts": time.time(), "venue": self.name, "kind": kind, "symbol": symbol, "detail": detail[:200]})
+
+    def reset_books(self, symbols: Optional[list[str]] = None) -> None:
+        """Invalidate books (all, or the given symbols) until a fresh snapshot arrives."""
+        for s in list(self.books if symbols is None else symbols):
+            self.books.pop(s, None)
+            self.book_epoch[s] = self.book_epoch.get(s, 0) + 1
+        if symbols is None:
+            for s in self.markets:
+                self.book_epoch[s] = self.book_epoch.get(s, 0) + 1
+        self.market_event.set()
+
+    def epoch(self, symbol: str) -> tuple[int, int]:
+        return (self.generation, self.book_epoch.get(symbol, 0))
 
     def quote_age(self, symbol: str, now: Optional[float] = None) -> float:
         """Seconds since the book was last confirmed current.

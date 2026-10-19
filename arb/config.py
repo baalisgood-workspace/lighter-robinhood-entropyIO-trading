@@ -60,6 +60,8 @@ class VenueConfig:
     dex: str = "io"  # entropy only: HIP-3 dex name
     leverage: int = 3  # entropy only: isolated leverage set at start in live mode
     funding_poll_seconds: float = 60.0
+    liveness_s: float = 5.0  # WS: protocol ping every liveness/2; any received frame counts as alive
+    quick_resume_s: float = 10.0  # WS: socket closed when silent for liveness + quick_resume
 
     @property
     def kind(self) -> str:
@@ -76,6 +78,10 @@ class StrategyConfig:
     order_value_usdc: float = 100.0  # max notional per maker order (slice)
     session: str = "24x7"  # 24x7 | us_equity
     offhours_threshold_pct: Optional[float] = None  # us_equity: T1 outside NY regular hours
+    # close-profit floor (FIFO two-leg): a grid younger than close_floor_timeout_s only closes when the
+    # realised raw spread of its opening fills + the closing quote >= min_close_profit_pct (before fees).
+    min_close_profit_pct: Optional[float] = 0.01  # null disables the floor
+    close_floor_timeout_s: float = 600.0
 
 
 @dataclass
@@ -93,7 +99,14 @@ class BasisConfig:
 
 @dataclass
 class ExecutionConfig:
-    maker_price_mode: str = "join"  # join: rest at best bid/ask; improve: one tick inside if spread allows
+    # join: rest at best bid/ask; improve: one tick inside if spread allows;
+    # threshold: rest at the exact price that yields the required edge vs the taker book (centred on the
+    # basis EMA), clamped to the nearest passive tick - the order waits for the market to come to it.
+    maker_price_mode: str = "join"
+    requote_threshold_pct: float = 0.006  # threshold mode: reprice when the fair price moves more than this
+    max_order_age_s: float = 30.0  # threshold mode: refresh a resting order at least this often
+    max_requotes_per_s: float = 2.0  # cancel/replace rate limit per symbol (risk cancels bypass it)
+    threshold_max_gap_pct: Optional[float] = None  # threshold mode: only rest when the edge is within this of the trigger
     maker_timeout_s: float = 20.0
     requote_when_not_best: bool = True
     max_requotes: int = 5
@@ -101,12 +114,16 @@ class ExecutionConfig:
     cancel_adverse_pct: float = 0.03  # cancel maker when edge at our price drops below threshold - this
     hedge_slippage_pct: float = 0.05  # IOC limit = best price +/- this
     hedge_slippage_step_pct: float = 0.05  # extra slippage per retry
-    hedge_max_attempts: int = 4
+    hedge_max_attempts: int = 4  # counts only confirmed ZERO-fill IOCs; partial fills do not use up the budget
+    hedge_max_orders: int = 12  # hard cap of hedge IOCs per hedge call (partials included)
+    hedge_min_notional_usdc: float = 10.0  # accumulate partial maker fills until the hedge reaches this
     close_mode: str = "maker_taker"  # maker_taker | taker_taker
     order_poll_interval_s: float = 1.0  # REST fallback poll period when no push update arrives
     order_final_timeout_s: float = 8.0  # wait for final state after cancel / IOC
     cooldown_s: float = 1.0
-    emergency_unwind: bool = True  # if hedge fails, flatten the filled maker qty with IOC reduce-only
+    # If the hedge fails: false (default) = keep both legs as they are, cancel all makers and lock the
+    # instance for manual intervention; true = first try to flatten the unhedged maker fill with IOC.
+    emergency_unwind: bool = False
 
 
 @dataclass
@@ -127,6 +144,11 @@ class RiskConfig:
     reconcile_tolerance_mult: float = 1.5  # x max(min_qty) of the two venues
     max_consecutive_failures: int = 3
     failure_pause_s: float = 300.0
+    warmup_fresh_s: float = 60.0  # continuous fresh two-venue data needed before quoting (after start/reconnect/gap)
+    quick_resume_s: float = 10.0  # a freshness gap shorter than this keeps the warmup (same socket generation)
+    max_leverage: float = 2.0  # gross notional on a venue (this instance) / venue equity
+    reserve_ratio: float = 0.02  # keep this share of equity unused
+    max_unhedged_notional_usdc: float = 500.0  # residual (unhedged) notional above this blocks new opens
 
 
 @dataclass
@@ -177,6 +199,7 @@ class AppConfig:
     data_dir: str = "data"
     log_dir: str = "logs"
     sampler_interval_s: float = 5.0
+    max_parallel_slices: int = 1  # concurrent maker slices (different symbols) per instance
     ui_refresh_s: float = 1.0
     source: str = ""
 
@@ -292,7 +315,7 @@ def parse_config(raw: dict) -> AppConfig:
     tr = raw.get("trading") or {}
     paths = raw.get("paths") or {}
     for section, data, keys in (("market_data", md, {"watch_all_venues"}),
-                                ("trading", tr, {"close_only", "allow_preexisting_positions"}),
+                                ("trading", tr, {"close_only", "allow_preexisting_positions", "max_parallel_slices"}),
                                 ("paths", paths, {"data_dir", "log_dir"})):
         if set(data) - keys:
             raise ConfigError(f"{section}: unknown keys {sorted(set(data) - keys)}")
@@ -303,6 +326,7 @@ def parse_config(raw: dict) -> AppConfig:
         watch_all_venues=bool(md.get("watch_all_venues", True)),
         close_only=bool(tr.get("close_only", False)),
         allow_preexisting_positions=bool(tr.get("allow_preexisting_positions", False)),
+        max_parallel_slices=int(tr.get("max_parallel_slices", 1)),
         data_dir=str(paths.get("data_dir", "data")),
         log_dir=str(paths.get("log_dir", "logs")),
         sampler_interval_s=float(raw.get("sampler_interval_s", 5.0)),
@@ -329,6 +353,11 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"venues.{v.name}: maker_fee_pct/taker_fee_pct are required")
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):
             errs.append(f"venues.{v.name}.leverage must be 1..50")
+    if not (1 <= cfg.max_parallel_slices <= 32):
+        errs.append("trading.max_parallel_slices must be 1..32")
+    for v in cfg.venues.values():
+        if v.liveness_s <= 0 or v.quick_resume_s < 0:
+            errs.append(f"venues.{v.name}: liveness_s > 0, quick_resume_s >= 0")
     if len(cfg.enabled_venues()) > 2:
         errs.append(f"at most two venues may be enabled for trading, got {cfg.enabled_venues()}")
     for s in cfg.symbols.values():
@@ -355,8 +384,16 @@ def validate(cfg: AppConfig) -> list[str]:
                 errs.append(f"{p}.basis: need max_gap < recovery <= reset_after")
             if b.warmup_seconds < b.drift_seconds:
                 errs.append(f"{p}.basis: warmup_seconds must be >= drift_seconds")
-        if ex.maker_price_mode not in ("join", "improve"):
-            errs.append(f"{p}.execution.maker_price_mode must be join|improve")
+        if ex.maker_price_mode not in ("join", "improve", "threshold"):
+            errs.append(f"{p}.execution.maker_price_mode must be join|improve|threshold")
+        if ex.requote_threshold_pct < 0 or ex.max_order_age_s <= 0 or ex.max_requotes_per_s <= 0:
+            errs.append(f"{p}.execution: requote_threshold_pct>=0, max_order_age_s>0, max_requotes_per_s>0")
+        if ex.hedge_max_orders < ex.hedge_max_attempts or ex.hedge_min_notional_usdc < 0:
+            errs.append(f"{p}.execution: hedge_max_orders >= hedge_max_attempts, hedge_min_notional_usdc >= 0")
+        if st.min_close_profit_pct is not None and st.close_floor_timeout_s < 0:
+            errs.append(f"{p}.strategy: close_floor_timeout_s must be >= 0")
+        if rk.warmup_fresh_s < 0 or rk.quick_resume_s < 0 or rk.max_leverage <= 0 or not (0 <= rk.reserve_ratio < 1):
+            errs.append(f"{p}.risk: warmup_fresh_s>=0, quick_resume_s>=0, max_leverage>0, 0<=reserve_ratio<1")
         if ex.close_mode not in ("maker_taker", "taker_taker"):
             errs.append(f"{p}.execution.close_mode must be maker_taker|taker_taker")
         if ex.maker_timeout_s <= 0 or ex.hedge_max_attempts < 1 or ex.hedge_slippage_pct <= 0:

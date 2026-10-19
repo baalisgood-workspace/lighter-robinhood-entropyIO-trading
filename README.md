@@ -18,7 +18,7 @@
    机器人用 1 小时时间加权 EMA 跟踪基差，只交易 **相对基差的偏离（dev）**，不是原始价差。
    EMA 需预热 `warmup_seconds`（默认 1 小时）才会交易；断线会进入恢复期，长时间断线会重置。状态保存在 `data/basis_state.json`，重启不必重新预热（10 分钟内）。
 3. **开仓信号**：`dev ≥ T1 + (k-1)·step + 往返手续费 + 不利资金费` → 开第 k 层网格。
-4. **执行**：在 maker 交易所挂 post-only 单（跟随最优价，不在最优就撤单重挂），每成交一部分就立即在 taker 交易所用 IOC 对冲；对冲失败会逐步加大滑点重试，仍失败则在 maker 端 reduce-only 紧急平掉，再失败就 **HALT**（停止并报警）。
+4. **执行**：在 maker 交易所挂 post-only 单（跟随最优价，不在最优就撤单重挂），每成交一部分就立即在 taker 交易所用 IOC 对冲；对冲失败会逐步加大滑点重试（只有“确认零成交”的 IOC 才消耗重试次数），仍失败则 **HALT + 人工介入锁**：撤掉所有 maker 单、保留两边仓位、写入 `data/<交易对>/MANUAL_INTERVENTION.json`，重启后也不会自动恢复（可选 `emergency_unwind: true` 先在 maker 端 IOC 平掉）。
 5. **平仓**：dev 回落到平仓线（第 1 层 = T1×`first_close_ratio`，第 k 层 = 第 k-1 层的开仓线），同样 maker→taker（或 `close_mode: taker_taker`）。
 6. **风控**：报价新鲜度、深度/滑点带、价格稳定性、资金费过滤、余额下限、单标的/单交易所名义上限、仓位对账（两次不一致即 HALT）、连续失败暂停、单实例锁、退出时撤单。
 
@@ -123,6 +123,31 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 | `risk.max_symbol_value_usdc` | 600 | 单标的最大名义 |
 | `risk.max_venue_notional_usdc` | 2000 | 单交易所最大名义 |
 | `risk.min_available_usdc` | 100 | 可用余额下限 |
+| `strategy.min_close_profit_pct` / `close_floor_timeout_s` | 0.01 / 600 | 平仓利润地板（见下） |
+| `execution.maker_price_mode` | join | `join` / `improve` / `threshold`（见下） |
+| `execution.hedge_min_notional_usdc` | 10 | 部分成交累积到此名义才对冲 |
+| `execution.emergency_unwind` | false | 对冲失败是否自动在 maker 端平掉 |
+| `risk.warmup_fresh_s` / `quick_resume_s` | 60 / 10 | 连续新鲜行情预热 / 短断线保留预热 |
+| `risk.max_leverage` / `reserve_ratio` | 2 / 0.02 | 单交易所总名义 ≤ 权益×(1−预留)×杠杆 |
+| `risk.max_unhedged_notional_usdc` | 500 | 未对冲残差超过即停止开仓 |
+| `trading.max_parallel_slices` | 1 | 同时执行的 maker 单（不同标的）数量 |
+
+## 从 arcus-maker-lighter-taker 移植的改进
+
+以下改进来自 `baalisgood/arcus-maker-lighter-taker`（main @7ed5f74），已改写为与交易所无关的实现，四个交易所、所有交易对都生效：
+
+1. **行情新鲜度 / 心跳**（`venues/transport.py`）：所有收到的帧（包括协议 ping/pong 控制帧）都刷新存活时间；每 `liveness_s/2`（默认 2.5s）主动 ping，`liveness_s + quick_resume_s` 内无回应即断开重连；重连 / 序号断档（Lighter `begin_nonce` 不连续）/ Arcus `degraded` 都会作废该标的盘口（epoch+1），并写入健康告警。
+2. **连续新鲜预热**：两边行情连续新鲜 `warmup_fresh_s`（60s）后才允许挂单；同一连接内 < `quick_resume_s` 的短暂中断保留预热，重连或断档则重新预热。按标的隔离：一个标的行情不新鲜只影响它自己。
+3. **阈值挂单模式** `maker_price_mode: threshold`：maker 单挂在“刚好满足所需 dev（以基差 EMA 为中心）”的价格上并钳到最近的被动 tick，等行情过来成交；公允价变动 > `requote_threshold_pct`（0.006%）或挂单超过 `max_order_age_s`（30s）就改价，每标的每秒最多 `max_requotes_per_s`（2）次，风控撤单不受限；撤单确认终态后才挂新单。建议配合 `trading.max_parallel_slices > 1` 和 maker 端限频宽松的交易所（Arcus / Entropy）使用。
+4. **FIFO 平仓利润地板**：每层网格记录开仓 maker/taker 实际成交均价对应的原始价差（FIFO 批次）；在 `close_floor_timeout_s`（600s）内的批次，只有“开仓原始价差 + 平仓原始价差 ≥ `min_close_profit_pct`”才平仓（不受基差漂移影响，只会让平仓更保守）；超时的批次回到原有 EMA 平仓规则。
+5. **碎单累积**：部分成交累积到满足交易所最小量和 `hedge_min_notional_usdc`（10U）才对冲；更小的残差计入风险，并在下一笔同方向切片里一起对冲，不再单独在 maker 端市价平掉。
+6. **对冲重试预算**：只有确认零成交的 IOC 才计入 `hedge_max_attempts`，部分成交继续对冲（`hedge_max_orders` 硬上限 12）。
+7. **严重故障 → 人工介入锁**：任何 HALT 都会撤掉所有 maker 单、保留仓位、持久化第一次故障原因到 `MANUAL_INTERVENTION.json`；该交易对重启会拒绝运行，核对两边仓位后执行 `python -m arb unlock --venues a,b` 解锁。
+8. **资金约束**：单交易所总名义（含进行中的切片）≤ 权益 ×(1−2%)× `max_leverage`(2)；未对冲名义 > 500U 停止开仓；对账时暂停新切片，等进行中的切片结束后再对账。
+9. **诊断日志**：`data/<交易对>/events.jsonl` 记录每笔开/平（成交均价、原始/调整价差、地板、改价次数、零成交对冲次数、残差、毛利）、HALT、行情健康告警（reconnect / connection_timeout / sequence_gap / degraded）、各标的可交易时长占比；`python -m arb report` 会额外输出成交统计。
+10. **下单安全**：HTTP / WebSocket 一律拒绝重定向（被重定向的写请求视为结果未知）；Lighter / Arcus 每账户签名串行，maker 单在拿到写锁后、签名前再检查行情连接。
+
+未移植：SQLite 持久账本、paper 撮合模拟、Lighter/Arcus 端点硬编码白名单、原仓库的单向 Arcus→Lighter 专用逻辑（本项目四交易所通用，结构不同）。
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
@@ -138,7 +163,8 @@ arb/
   engine/claims.py  多进程之间的标的归属锁
   engine/basis.py   基差 EMA
   engine/signals.py 信号、网格线、VWAP
-  engine/executor.py maker→taker 执行、增量对冲、紧急平仓
+  venues/transport.py WebSocket 帧级心跳 / 拒绝重定向
+  engine/executor.py maker→taker 执行、阈值挂单、增量对冲、碎单累积
   engine/state.py   网格仓位与残差（data/<交易对>/positions.json）
   engine/engine.py  主循环、决策、对账、采样
   ui.py / report.py 终端面板 / 价差统计

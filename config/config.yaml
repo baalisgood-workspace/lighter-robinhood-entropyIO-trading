@@ -52,6 +52,7 @@ market_data:
 trading:
   close_only: false
   allow_preexisting_positions: false
+  max_parallel_slices: 1         # >1: quote several symbols at once (recommended with maker_price_mode: threshold)
 
 paths:
   data_dir: data
@@ -68,6 +69,10 @@ defaults:
     first_close_ratio: 0.5
     grid_value_usdc: 200
     order_value_usdc: 100
+    # FIFO two-leg close-profit floor (ported from arcus-maker-lighter-taker): a grid younger than
+    # close_floor_timeout_s only closes if opening raw spread + closing raw spread >= min_close_profit_pct
+    min_close_profit_pct: 0.01   # null disables
+    close_floor_timeout_s: 600
   basis:
     enabled: true
     ema_seconds: 3600
@@ -75,15 +80,25 @@ defaults:
     drift_seconds: 3600
     max_drift_pct: 0.30
   execution:
-    maker_price_mode: join
+    maker_price_mode: join       # join | improve | threshold (rest at the exact trigger price, EMA-centred)
     maker_timeout_s: 20
+    requote_threshold_pct: 0.006 # threshold mode: reprice when the fair price moves more than this
+    max_order_age_s: 30          # threshold mode: refresh resting orders at least this often
+    max_requotes_per_s: 2        # cancel/replace rate limit per symbol (risk cancels bypass it)
     hedge_slippage_pct: 0.05
-    hedge_max_attempts: 4
+    hedge_max_attempts: 4        # counts only zero-filled IOCs; partial fills keep hedging
+    hedge_min_notional_usdc: 10  # accumulate partial maker fills (dust) until the hedge is >= this
     close_mode: maker_taker
+    emergency_unwind: false      # false: on hedge failure keep both legs, cancel makers, lock for manual intervention
   risk:
     min_available_usdc: 100
     max_symbol_value_usdc: 600
     max_venue_notional_usdc: 2000
+    warmup_fresh_s: 60           # continuous fresh two-venue data before quoting (start / reconnect / gap)
+    quick_resume_s: 10           # shorter freshness gaps keep the warmup
+    max_leverage: 2              # gross notional per venue / (equity * (1 - reserve_ratio))
+    reserve_ratio: 0.02
+    max_unhedged_notional_usdc: 500
 
 # symbol key -> market name on each venue. A symbol trades on a pair only if both venues list it.
 # Arcus names are "<BASE>-USD". Arcus has no OPENAI/ANTHROPIC.

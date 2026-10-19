@@ -8,11 +8,13 @@ from arb.engine.executor import ExecResult
 from arb.models import Balance
 
 
-def make_engine(tmp_path, fake_pair, **strategy):
+def make_engine(tmp_path, fake_pair, risk=None, execution=None, trading=None, **strategy):
     M, T = fake_pair
     raw = {"venues": {"lighter": {"enabled": True}, "lighter_rh": {"enabled": True}},
            "market_data": {"watch_all_venues": False}, "paths": {"data_dir": str(tmp_path)},
-           "defaults": {"basis": {"enabled": False}, "strategy": strategy},
+           "trading": trading or {},
+           "defaults": {"basis": {"enabled": False}, "strategy": strategy,
+                        "risk": {"warmup_fresh_s": 0, **(risk or {})}, "execution": execution or {}},
            "symbols": {"X": {"venues": {"lighter": "X", "lighter_rh": "X"}}}}
     cfg = parse_config(raw)
     eng = Engine(cfg, {"lighter_rh": M, "lighter": T}, live=True)

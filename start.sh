@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: ./start.sh setup | check | monitor | live | positions | report  [extra args]
+# Usage: ./start.sh setup | check | monitor | live | positions | report | unlock  [extra args]
 set -euo pipefail
 cd "$(dirname "$0")"
 cmd="${1:-monitor}"; shift || true

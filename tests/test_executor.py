@@ -51,7 +51,7 @@ def test_hedge_failure_emergency_unwind(fake_pair):
     M, T = fake_pair
     M.maker_fills = [(0.05, D("1"))]
     T.ioc_ratio = D("0")
-    r = run(M, T, plan())
+    r = run(M, T, plan(emergency_unwind=True))
     assert r.taker_filled == 0 and r.maker_unwound == D("1") and not r.halted
     assert M.ioc_log and M.ioc_log[0].is_buy and M.ioc_log[0].reduce_only  # buy back the short, reduce-only
 
@@ -61,7 +61,7 @@ def test_hedge_and_unwind_failure_halts(fake_pair):
     M.maker_fills = [(0.05, D("1"))]
     T.ioc_ratio = D("0")
     M.ioc_ratio = D("0")
-    r = run(M, T, plan())
+    r = run(M, T, plan(emergency_unwind=True))
     assert r.halted and "unhedged" in r.error
 
 
