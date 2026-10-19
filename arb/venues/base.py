@@ -49,6 +49,11 @@ class Venue(ABC):
         now = time.time() if now is None else now
         return now - max(b.ts_local, self.alive_ts if self.connected else 0.0)
 
+    @property
+    def account_id(self) -> str:
+        """Identity of the trading account (used to keep parallel instances off each other's symbols)."""
+        return "default"
+
     # ------------------------------------------------------------ lifecycle
     @abstractmethod
     async def start(self, symbols: list[str], trading: bool) -> None: ...

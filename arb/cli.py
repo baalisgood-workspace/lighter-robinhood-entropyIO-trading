@@ -27,6 +27,8 @@ def _overrides(args) -> dict:
         ov.setdefault("trading", {})["close_only"] = True
     if getattr(args, "no_watch_all", False):
         ov.setdefault("market_data", {})["watch_all_venues"] = False
+    elif getattr(args, "watch_all", False) or getattr(args, "cmd", "") == "monitor":
+        ov.setdefault("market_data", {})["watch_all_venues"] = True
     return ov
 
 
@@ -71,21 +73,28 @@ def _creds_present(cfg: AppConfig, name: str) -> bool:
     v = cfg.venues[name]
     if v.kind == "hyperliquid":
         keys = [f"{v.env_prefix}_ACCOUNT_ADDRESS", f"{v.env_prefix}_API_PRIVATE_KEY"]
+    elif v.kind == "arcus":
+        keys = [f"{v.env_prefix}_ACCOUNT_ADDRESS", f"{v.env_prefix}_API_KEY", f"{v.env_prefix}_API_SIGNING_KEY"]
     else:
         keys = [f"{v.env_prefix}_ACCOUNT_INDEX", f"{v.env_prefix}_API_KEY_INDEX", f"{v.env_prefix}_API_KEY_PRIVATE_KEY"]
     return all(os.environ.get(k) for k in keys)
 
 
+def instance_dir(cfg: AppConfig, live: bool) -> Path:
+    """Each live pair has its own state directory, so several pairs can run in parallel."""
+    return Path(cfg.data_dir) / (cfg.active_pair().key if live else "monitor")
+
+
 @contextlib.contextmanager
-def _lock(cfg: AppConfig):
+def _lock(d: Path):
     import fcntl
-    Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
-    path = Path(cfg.data_dir) / "arb.lock"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / "arb.lock"
     fh = path.open("w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise ConfigError(f"another instance is running (lock {path})")
+        raise ConfigError(f"another instance is already running with this pair/mode (lock {path})")
     fh.write(str(os.getpid()))
     fh.flush()
     try:
@@ -128,7 +137,7 @@ async def _run(cfg: AppConfig, live: bool, duration: float | None, ui: bool) -> 
     from arb.ui import run_ui
 
     venues = await _start_venues(cfg, live)
-    eng = Engine(cfg, venues, live=live)
+    eng = Engine(cfg, venues, live=live, data_dir=instance_dir(cfg, live))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -189,10 +198,10 @@ async def _positions(cfg: AppConfig) -> int:
             print(f"{n}: error {exc}")
         finally:
             await v.stop()
-    book = PositionBook(Path(cfg.data_dir) / "positions.json")
-    print("local state (data/positions.json):")
+    print("local state (data/<pair>/positions.json):")
     any_open = False
-    for sp in book.items.values():
+    sps = [sp for f in sorted(Path(cfg.data_dir).glob("*/positions.json")) for sp in PositionBook(f).items.values()]
+    for sp in sps:
         if not sp.is_flat():
             any_open = True
             print(f"  {sp.pair_key} {sp.symbol}: {sp.direction} grids="
@@ -203,7 +212,7 @@ async def _positions(cfg: AppConfig) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="arb", description="Lighter / Lighter-RH / Entropy (io) maker->taker spread arbitrage")
+    ap = argparse.ArgumentParser(prog="arb", description="Lighter / Lighter-RH / Entropy (io) / Arcus maker->taker spread arbitrage (one pair per process)")
     ap.add_argument("--config", default="config/config.yaml")
     ap.add_argument("--env-file", default=".env")
     ap.add_argument("--log-level", default="INFO")
@@ -212,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     def common(p):
         p.add_argument("--venues", help="comma list overriding venues.*.enabled, e.g. lighter,entropy")
         p.add_argument("--no-watch-all", action="store_true", help="only stream data for the enabled venues")
+        p.add_argument("--watch-all", action="store_true", help="also stream/display the other venues (default for monitor)")
         return p
 
     common(sub.add_parser("check", help="validate config and show pair/symbol mapping (offline)"))
@@ -240,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report":
         from arb.report import print_report
         days = args.days.split(",") if args.days else None
-        return print_report(Path(cfg.data_dir) / "spread_samples", args.threshold, days)
+        return print_report(Path(cfg.data_dir), args.threshold, days)
 
     from arb.util import setup_logging
     use_ui = args.cmd in ("monitor", "live") and not args.no_ui and sys.stdout.isatty()
@@ -267,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("aborted")
                 return 1
     try:
-        with _lock(cfg):
+        with _lock(instance_dir(cfg, live)):
             return asyncio.run(_run(cfg, live, getattr(args, "duration", None), use_ui))
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)

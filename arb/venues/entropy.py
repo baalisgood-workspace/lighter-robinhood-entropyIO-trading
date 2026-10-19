@@ -78,6 +78,10 @@ class EntropyVenue(Venue):
         self._by_oid: dict[int, str] = {}  # oid -> client_id (cloid raw)
         self._fills: dict[int, dict[int, tuple[Decimal, Decimal]]] = {}  # oid -> tid -> (sz, px)
 
+    @property
+    def account_id(self) -> str:
+        return (self.address or "none").lower()
+
     def has_credentials(self) -> bool:
         return bool(self.address and self._private_key)
 

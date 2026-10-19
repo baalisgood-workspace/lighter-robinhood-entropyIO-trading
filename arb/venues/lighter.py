@@ -85,6 +85,10 @@ class LighterVenue(Venue):
         self.private_connected = False
 
     # ------------------------------------------------------------ lifecycle
+    @property
+    def account_id(self) -> str:
+        return self.account_index or "none"
+
     def has_credentials(self) -> bool:
         return bool(self.account_index and self.api_key_index and self._api_private_key)
 

@@ -29,7 +29,24 @@ def test_exactly_two_rule():
 
 def test_watched_pairs_all_three():
     cfg = parse_config(raw(lighter=True, lighter_rh=True))
-    assert [p.key for p in cfg.watched_pairs()] == ["lighter+lighter_rh", "lighter+entropy", "lighter_rh+entropy"]
+    cfg.watch_all_venues = True
+    assert [p.key for p in cfg.watched_pairs()] == ["lighter+lighter_rh", "lighter+entropy", "lighter+arcus",
+                                                    "lighter_rh+entropy", "lighter_rh+arcus", "entropy+arcus"]
+
+
+def test_arcus_pairs_and_roles():
+    r = raw(lighter=True, arcus=True)
+    r["symbols"]["SNDK"] = {"venues": {"lighter": "SNDK", "arcus": "SNDK-USD", "entropy": "io:SNDK"}}
+    cfg = parse_config(r)
+    p = cfg.active_pair()
+    assert p.maker == "arcus" and p.taker == "lighter"
+    assert [s.key for s in cfg.symbols_for_pair(p)] == ["SNDK"]
+    assert cfg.venues["arcus"].taker_fee_pct == 0.0225
+    r["venues"] = {"entropy": {"enabled": True}, "arcus": {"enabled": True}}
+    assert parse_config(r).active_pair().taker == "entropy"
+    r["venues"]["lighter"] = {"enabled": True}
+    with pytest.raises(ConfigError, match="at most two"):
+        parse_config(r)
 
 
 def test_roles_override_and_validation():

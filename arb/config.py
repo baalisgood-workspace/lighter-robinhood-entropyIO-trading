@@ -1,6 +1,6 @@
 """Configuration loading and validation.
 
-One YAML file (config/config.yaml) describes the three venues, which two are
+One YAML file (config/config.yaml) describes the four venues, which two are
 enabled for trading, the maker venue of every pair, symbols and parameters.
 """
 from __future__ import annotations
@@ -15,8 +15,8 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-VENUE_NAMES = ("lighter", "lighter_rh", "entropy")
-VENUE_KINDS = {"lighter": "lighter", "lighter_rh": "lighter", "entropy": "hyperliquid"}
+VENUE_NAMES = ("lighter", "lighter_rh", "entropy", "arcus")
+VENUE_KINDS = {"lighter": "lighter", "lighter_rh": "lighter", "entropy": "hyperliquid", "arcus": "arcus"}
 
 
 class ConfigError(ValueError):
@@ -214,9 +214,18 @@ DEFAULT_VENUES = {
                        chain_id=466324, env_prefix="LIGHTER_RH"),
     "entropy": dict(rest_url="https://api.hyperliquid.xyz", ws_url="wss://api.hyperliquid.xyz/ws",
                     env_prefix="ENTROPY", requests_per_minute=600.0, maker_fee_pct=0.003, taker_fee_pct=0.009),
+    "arcus": dict(rest_url="https://api.arcus.xyz", ws_url="wss://api.arcus.xyz/v1/ws",
+                  env_prefix="ARCUS", requests_per_minute=120.0, maker_fee_pct=0.0, taker_fee_pct=0.0225),
 }
 
-DEFAULT_ROLES = {"lighter+lighter_rh": "lighter_rh", "lighter+entropy": "entropy", "lighter_rh+entropy": "entropy"}
+DEFAULT_ROLES = {
+    "lighter+lighter_rh": "lighter_rh",
+    "lighter+entropy": "entropy",
+    "lighter_rh+entropy": "entropy",
+    "lighter+arcus": "arcus",  # Arcus maker 0 / taker 0.0225%: quote on Arcus, hedge on fee-free Lighter
+    "lighter_rh+arcus": "arcus",
+    "entropy+arcus": "arcus",  # hedge on Entropy (taker 0.009%) rather than Arcus (0.0225%)
+}
 
 
 def load_config(path: str | Path, overrides: Optional[dict] = None) -> AppConfig:
@@ -232,7 +241,7 @@ def load_config(path: str | Path, overrides: Optional[dict] = None) -> AppConfig
 def parse_config(raw: dict) -> AppConfig:
     raw = copy.deepcopy(raw)
     allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s", "ui_refresh_s"}
-    unknown = set(raw) - allowed_top
+    unknown = {k for k in set(raw) - allowed_top if not str(k).startswith("x-")}  # x-*: YAML anchors
     if unknown:
         raise ConfigError(f"unknown top-level keys: {sorted(unknown)}")
 
@@ -316,7 +325,7 @@ def validate(cfg: AppConfig) -> list[str]:
             fee = getattr(v, fee_name)
             if fee is not None and not (0 <= fee < 1):
                 errs.append(f"venues.{v.name}.{fee_name} must be in [0, 1) percent")
-        if v.kind == "hyperliquid" and (v.maker_fee_pct is None or v.taker_fee_pct is None):
+        if v.kind in ("hyperliquid", "arcus") and (v.maker_fee_pct is None or v.taker_fee_pct is None):
             errs.append(f"venues.{v.name}: maker_fee_pct/taker_fee_pct are required")
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):
             errs.append(f"venues.{v.name}.leverage must be 1..50")

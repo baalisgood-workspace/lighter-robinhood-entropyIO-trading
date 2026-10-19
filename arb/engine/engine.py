@@ -15,6 +15,7 @@ from typing import Optional
 from arb.config import AppConfig, ConfigError, Pair, SymbolConfig, effective_t1
 from arb.engine import signals as sg
 from arb.engine.basis import BasisBook, BasisState
+from arb.engine.claims import Claims
 from arb.engine.executor import ExecPlan, ExecResult, Executor
 from arb.engine.state import PositionBook, SymbolPosition
 from arb.models import Balance, Position
@@ -45,6 +46,7 @@ class Ctx:
     paused_until: float = 0.0
     next_open: Optional[float] = None
     next_close: Optional[float] = None
+    claim_block: str = ""  # symbol owned by another instance on a shared account
 
     @property
     def key(self) -> str:
@@ -52,13 +54,15 @@ class Ctx:
 
 
 class Engine:
-    def __init__(self, cfg: AppConfig, venues: dict[str, Venue], live: bool):
+    def __init__(self, cfg: AppConfig, venues: dict[str, Venue], live: bool, data_dir: Optional[Path] = None):
         self.cfg = cfg
         self.venues = venues
         self.live = live
         enabled = cfg.enabled_venues()
         self.active: Optional[Pair] = cfg.active_pair() if (live or len(enabled) == 2) else None
-        data = Path(cfg.data_dir)
+        data = Path(data_dir) if data_dir is not None else Path(cfg.data_dir)
+        self.data_dir = data
+        self.claims: Optional[Claims] = None
         self.basis_book = BasisBook(data / "basis_state.json")
         self.positions = PositionBook(data / "positions.json")
         self.sample_dir = data / "spread_samples"
@@ -96,7 +100,7 @@ class Engine:
             raise ConfigError(f"no tradable symbol for active pair {self.active.key}")
 
     def active_ctxs(self) -> list[Ctx]:
-        return [c for c in self.ctxs if self.active and c.pair == self.active]
+        return [c for c in self.ctxs if self.active and c.pair == self.active and not c.claim_block]
 
     def position(self, ctx: Ctx) -> SymbolPosition:
         return self.positions.get(ctx.pair.key, ctx.sym.key)
@@ -106,9 +110,22 @@ class Engine:
         assert self.active is not None
         other = self.positions.open_pairs() - {self.active.key}
         if other:
-            raise ConfigError(
-                f"local state still has open positions on pair(s) {sorted(other)}. Enable exactly those two venues with "
-                f"trading.close_only: true and flatten them first (or resolve data/positions.json manually).")
+            raise ConfigError(f"{self.data_dir / 'positions.json'} has open positions of other pair(s) {sorted(other)}")
+        # parallel instances: claim every (venue account, symbol) this instance will trade
+        self.claims = Claims(Path(self.cfg.data_dir), self.active.key)
+        names = (self.active.maker, self.active.taker)
+        self.claims.write_accounts({n: self.venues[n].account_id for n in names})
+        for c in [c for c in self.ctxs if c.pair == self.active]:
+            for n in names:
+                why = self.claims.acquire(n, self.venues[n].account_id, c.sym.key)
+                if why:
+                    c.claim_block = why
+                    c.status = f"skipped: {why}"
+                    lvl = logging.ERROR if not self.position(c).is_flat() else logging.WARNING
+                    self.event(f"{c.sym.key} skipped: {why}", lvl)
+                    break
+        if not self.active_ctxs():
+            raise ConfigError("every symbol of this pair is owned by another running instance")
         await self.reconcile(initial=True)
         for vname in (self.active.maker, self.active.taker):
             syms = [c.maker_sym if vname == self.active.maker else c.taker_sym for c in self.active_ctxs()]
@@ -181,6 +198,8 @@ class Engine:
                     log.warning("cancel_all on shutdown failed for %s: %s", vname, exc)
         self.basis_book.save()
         self.positions.save()
+        if self.claims:
+            self.claims.release_all()
 
     async def _tick_loop(self) -> None:
         while not self.stopping:
@@ -298,6 +317,8 @@ class Engine:
         c.q_sell = sg.build_quote(sg.SELL_MAKER, mb, tb, c.qty, c.basis_value, ex.maker_price_mode, tick, rk.depth_levels, rk.depth_band_pct)
         c.q_buy = sg.build_quote(sg.BUY_MAKER, mb, tb, c.qty, c.basis_value, ex.maker_price_mode, tick, rk.depth_levels, rk.depth_band_pct)
         c.status = "ready" if c.ready else reason
+        if c.claim_block:
+            c.status = f"skipped: {c.claim_block}"
 
     # ------------------------------------------------------------ decide
     def _fees(self, c: Ctx) -> float:

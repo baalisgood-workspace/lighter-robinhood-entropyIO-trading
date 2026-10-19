@@ -16,9 +16,10 @@ def _q(xs: list[float], q: float) -> float:
     return xs[i]
 
 
-def load(sample_dir: Path, days: Optional[list[str]] = None) -> list[dict]:
+def load(data_root: Path, days: Optional[list[str]] = None) -> list[dict]:
+    """All samples under data/<instance>/spread_samples/*.csv (monitor and every live pair)."""
     rows = []
-    for f in sorted(sample_dir.glob("*.csv")):
+    for f in sorted(data_root.glob("*/spread_samples/*.csv")):
         if days and f.stem not in days:
             continue
         with f.open(newline="") as fh:
@@ -56,10 +57,10 @@ def summarize(rows: list[dict], threshold: float) -> list[dict]:
     return out
 
 
-def print_report(sample_dir: Path, threshold: float, days: Optional[list[str]] = None) -> int:
-    rows = load(sample_dir, days)
+def print_report(data_root: Path, threshold: float, days: Optional[list[str]] = None) -> int:
+    rows = load(data_root, days)
     if not rows:
-        print(f"no samples in {sample_dir} (run `python -m arb monitor` first)")
+        print(f"no samples under {data_root}/*/spread_samples (run `python -m arb monitor` first)")
         return 1
     stats = summarize(rows, threshold)
     if not stats:

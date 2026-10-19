@@ -1,11 +1,15 @@
 # lighter-robinhood-entropyIO-trading configuration
 #
-# Venue toggle: enable EXACTLY TWO venues to trade (live). The bot always arbitrages
-# one pair: maker (post-only) on one venue, IOC hedge (taker) on the other.
-#   lighter     = Lighter mainnet perps            (fees 0)
-#   lighter_rh  = Lighter on Robinhood Chain        (fees 0, chain id 466324)
+# Venue toggle: enable EXACTLY TWO venues to trade (live). One process arbitrages one
+# pair: maker (post-only) on one venue, IOC hedge (taker) on the other.
+#   lighter     = Lighter mainnet perps              (fees 0)
+#   lighter_rh  = Lighter on Robinhood Chain          (fees 0, chain id 466324)
 #   entropy     = Entropy, Hyperliquid HIP-3 dex "io" (io:OAI, io:ANTH, io:SNDK ...)
-# Override from the CLI without editing this file:  python -m arb live --venues lighter,entropy
+#   arcus       = Arcus perps                         (Base tier: maker 0, taker 0.0225%)
+# Pick the pair on the command line instead of editing this file, and run several pairs
+# in parallel, one terminal / service each:
+#   python -m arb live --venues lighter,arcus
+#   python -m arb live --venues lighter_rh,entropy
 venues:
   lighter:
     enabled: true
@@ -26,15 +30,24 @@ venues:
     taker_fee_pct: 0.009
     leverage: 3                  # isolated; OAI max 6x
     requests_per_minute: 600
+  arcus:
+    enabled: false
+    # https://api.arcus.xyz/v1/feetiers  Base: maker 0 / taker 0.0225% (225 ppm). Update for your tier.
+    maker_fee_pct: 0.0
+    taker_fee_pct: 0.0225
+    requests_per_minute: 120
 
 # Who quotes (maker) in each pair. The other venue is the IOC taker / hedge leg.
 roles:
   lighter+lighter_rh: lighter_rh
   lighter+entropy: entropy
   lighter_rh+entropy: entropy
+  lighter+arcus: arcus           # quote on Arcus (maker 0), hedge on fee-free Lighter
+  lighter_rh+arcus: arcus
+  entropy+arcus: arcus           # hedge on Entropy (taker 0.009%) instead of Arcus (0.0225%)
 
 market_data:
-  watch_all_venues: true         # monitor shows all three pairs; only the enabled pair trades
+  watch_all_venues: false        # live: stream only the two traded venues (monitor always watches all)
 
 trading:
   close_only: false
@@ -73,38 +86,76 @@ defaults:
     max_venue_notional_usdc: 2000
 
 # symbol key -> market name on each venue. A symbol trades on a pair only if both venues list it.
+# Arcus names are "<BASE>-USD". Arcus has no OPENAI/ANTHROPIC.
+x-us: &us {session: us_equity, offhours_threshold_pct: 0.60}
 symbols:
   OPENAI:
     venues: {lighter: OPENAI, lighter_rh: OPENAI, entropy: "io:OAI"}
   ANTHROPIC:
     venues: {lighter: ANTHROPIC, lighter_rh: ANTHROPIC, entropy: "io:ANTH"}
   SNDK:
-    venues: {lighter: SNDK, lighter_rh: SNDK, entropy: "io:SNDK"}
-    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+    venues: {lighter: SNDK, lighter_rh: SNDK, entropy: "io:SNDK", arcus: SNDK-USD}
+    strategy: *us
   MU:
-    venues: {lighter: MU, lighter_rh: MU}
-    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+    venues: {lighter: MU, lighter_rh: MU, arcus: MU-USD}
+    strategy: *us
   AMD:
-    venues: {lighter: AMD, lighter_rh: AMD}
-    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+    venues: {lighter: AMD, lighter_rh: AMD, arcus: AMD-USD}
+    strategy: *us
   NVDA:
-    venues: {lighter: NVDA, lighter_rh: NVDA}
-    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+    venues: {lighter: NVDA, lighter_rh: NVDA, arcus: NVDA-USD}
+    strategy: *us
   INTC:
-    venues: {lighter: INTC, lighter_rh: INTC}
-    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+    venues: {lighter: INTC, lighter_rh: INTC, arcus: INTC-USD}
+    strategy: *us
   SPCX:
-    venues: {lighter: SPCX, lighter_rh: SPCX}
-    strategy: {session: us_equity, offhours_threshold_pct: 0.60}
+    venues: {lighter: SPCX, lighter_rh: SPCX, arcus: SPCX-USD}
+    strategy: *us
+  TSLA:
+    venues: {lighter: TSLA, lighter_rh: TSLA, arcus: TSLA-USD}
+    strategy: *us
+  AAPL:
+    venues: {lighter: AAPL, lighter_rh: AAPL, arcus: AAPL-USD}
+    strategy: *us
+  AMZN:
+    venues: {lighter: AMZN, lighter_rh: AMZN, arcus: AMZN-USD}
+    strategy: *us
+  GOOGL:
+    venues: {lighter: GOOGL, lighter_rh: GOOGL, arcus: GOOGL-USD}
+    strategy: *us
+  META:
+    venues: {lighter: META, lighter_rh: META, arcus: META-USD}
+    strategy: *us
+  MSFT:
+    venues: {lighter: MSFT, lighter_rh: MSFT, arcus: MSFT-USD}
+    strategy: *us
+  PLTR:
+    venues: {lighter: PLTR, lighter_rh: PLTR, arcus: PLTR-USD}
+    strategy: *us
+  COIN:
+    venues: {lighter: COIN, lighter_rh: COIN, arcus: COIN-USD}
+    strategy: *us
+  SPY:
+    venues: {lighter: SPY, lighter_rh: SPY, arcus: SPY-USD}
+    strategy: *us
+  QQQ:
+    venues: {lighter: QQQ, lighter_rh: QQQ, arcus: QQQ-USD}
+    strategy: *us
+  NBIS:   # also io:NBIS on Entropy - add it after checking its Entropy fee (growth mode or not)
+    venues: {lighter: NBIS, arcus: NBIS-USD}
+    strategy: *us
+  DRAM:   # also io:DRAM on Entropy - add it after checking its Entropy fee (growth mode or not)
+    venues: {lighter: DRAM, arcus: DRAM-USD}
+    strategy: *us
   BTC:
-    venues: {lighter: BTC, lighter_rh: BTC}
+    venues: {lighter: BTC, lighter_rh: BTC, arcus: BTC-USD}
     strategy: {initial_threshold_pct: 0.15, grid_step_pct: 0.08}
   ETH:
-    venues: {lighter: ETH, lighter_rh: ETH}
+    venues: {lighter: ETH, lighter_rh: ETH, arcus: ETH-USD}
     strategy: {initial_threshold_pct: 0.15, grid_step_pct: 0.08}
   SOL:
-    venues: {lighter: SOL, lighter_rh: SOL}
-    strategy: {initial_threshold_pct: 0.20, grid_step_pct: 0.10}
+    venues: {lighter: SOL, lighter_rh: SOL, arcus: SOL-USD}
+    strategy: {initial_threshold_pct: 0.2, grid_step_pct: 0.1}
   HYPE:
-    venues: {lighter: HYPE, lighter_rh: HYPE}
-    strategy: {initial_threshold_pct: 0.20, grid_step_pct: 0.10}
+    venues: {lighter: HYPE, lighter_rh: HYPE, arcus: HYPE-USD}
+    strategy: {initial_threshold_pct: 0.2, grid_step_pct: 0.1}

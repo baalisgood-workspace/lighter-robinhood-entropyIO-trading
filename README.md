@@ -1,14 +1,15 @@
 # lighter-robinhood-entropyIO-trading
 
-三个交易所之间的 **maker → taker 价差套利**机器人：
+四个交易所之间的 **maker → taker 价差套利**机器人：
 
 | 名称 (`venues.*`) | 交易所 | 说明 |
 |---|---|---|
 | `lighter` | Lighter 主网永续 | 手续费 0 |
 | `lighter_rh` | Lighter Robinhood Chain | 手续费 0，chain id 466324 |
 | `entropy` | Entropy（Hyperliquid HIP-3，dex = `io`） | `io:OAI` / `io:ANTH` / `io:SNDK`，growth mode 费率 maker 0.003% / taker 0.009% |
+| `arcus` | Arcus 永续 | 市场名 `SNDK-USD` 等；Base 档 maker 0 / taker 0.0225% |
 
-三个交易所都可以开/关，但 **交易时永远只有两个开启，两两对冲**。`monitor` 模式可以同时看三组价差。
+每个进程只交易 **一对**（两个交易所对冲）。想同时跑多对，就 **多开几个进程，每个用 `--venues` 选两个交易所**（见下文“多开”）。`monitor` 会同时显示全部 6 组价差。
 
 ## 工作原理
 
@@ -34,6 +35,9 @@ roles:                      # 每一对里谁挂 maker 单
   lighter+lighter_rh: lighter_rh
   lighter+entropy:    entropy
   lighter_rh+entropy: entropy
+  lighter+arcus:      arcus     # Arcus maker 0 费，Lighter taker 0 费
+  lighter_rh+arcus:   arcus
+  entropy+arcus:      arcus     # 在 Entropy 吃单（0.009%）比在 Arcus 吃单（0.0225%）便宜
 ```
 
 也可以不改文件，直接在命令行切换：
@@ -42,11 +46,39 @@ roles:                      # 每一对里谁挂 maker 单
 python -m arb live --venues lighter,entropy        # Lighter 主网 ↔ Entropy
 python -m arb live --venues lighter_rh,entropy     # Lighter RH ↔ Entropy
 python -m arb live --venues lighter,lighter_rh     # Lighter 主网 ↔ Lighter RH
+python -m arb live --venues lighter,arcus          # Lighter 主网 ↔ Arcus
+python -m arb live --venues lighter_rh,arcus       # Lighter RH ↔ Arcus
+python -m arb live --venues entropy,arcus          # Entropy ↔ Arcus（目前只有 SNDK 重叠）
 ```
 
+各对重叠标的（默认配置）：
+
+| 交易对 | 标的 |
+|---|---|
+| lighter + lighter_rh | OPENAI、ANTHROPIC、SNDK、美股（MU/AMD/NVDA/INTC/SPCX/TSLA/AAPL/AMZN/GOOGL/META/MSFT/PLTR/COIN/SPY/QQQ）、BTC/ETH/SOL/HYPE |
+| lighter / lighter_rh + entropy | OPENAI、ANTHROPIC、SNDK |
+| lighter + arcus | SNDK、上面的美股、NBIS、DRAM、BTC/ETH/SOL/HYPE |
+| lighter_rh + arcus | SNDK、上面的美股、BTC/ETH/SOL/HYPE |
+| entropy + arcus | SNDK |
+
+## 多开（并行跑多对）
+
+每对一个进程（一个终端 / tmux 窗口 / systemd 服务）：
+
+```bash
+./start.sh live --venues lighter_rh,entropy --yes
+./start.sh live --venues lighter,arcus --yes
+```
+
+- 每对的状态独立保存在 `data/<交易对>/`（`positions.json`、`basis_state.json`、`spread_samples/`、`arb.lock`），同一对不能同时开两个进程。
+- **共用账户保护**：如果两个进程用的是同一个交易所账户（例如都用同一个 Lighter 主网账户），同一个标的只能被一个进程交易——先启动的进程会锁住 `交易所+账户+标的`（`data/claims/*.lock`），后启动的进程会跳过这个标的（面板显示 `skipped`）。某进程停了但还留有仓位时，该标的仍归它，直到平仓。这样可以避免两边仓位互相抵消、reduce-only 平仓被拒、对账误报、撤单撤到别的进程的单。
+- 想让两个进程交易同一个标的，就给其中一个用不同的子账户（Lighter 子账户 / Hyperliquid 子账户 / Arcus `ARCUS_ACCOUNT_INDEX` 0–9）。
+- 余额是共用的：每个进程各自按 `risk` 上限控制自己的仓位，总敞口 = 各进程之和，请据此设置上限。
+- `./start.sh positions` 会列出所有交易对的本地状态；`./start.sh report` 汇总所有目录的价差采样。
+
 - 开启超过 2 个 → 配置报错；`live` 必须正好 2 个。
-- 每个标的在 `symbols` 里写出各交易所的市场名；某一对只交易两边都有的标的（Entropy 目前只有 OPENAI / ANTHROPIC / SNDK 三个重叠）。
-- **切换交易对前先平仓**：如果 `data/positions.json` 里另一对还有仓位，`live` 会拒绝启动。先用原来那两个交易所 + `--close-only` 跑到平仓。
+- 每个标的在 `symbols` 里写出各交易所的市场名；某一对只交易两边都有的标的（Entropy 与 Lighter 重叠 OPENAI / ANTHROPIC / SNDK，与 Arcus 只重叠 SNDK）。
+- 停掉一对之前建议先 `--close-only` 跑到平仓；留着仓位也可以，下次启动同一对会继续管理（并对账）。
 
 ## 安装
 
@@ -71,6 +103,8 @@ RH 的 API key index 0–3 和 157 是保留的，请用 4–156 或 158–254�
 **Entropy**：Hyperliquid 账户地址 `ENTROPY_ACCOUNT_ADDRESS` + 已授权的 API（agent）钱包私钥 `ENTROPY_API_PRIVATE_KEY`（agent 钱包不能提现）。
 注意：HIP-3 dex 的保证金和 Hyperliquid 主 perp 账户是分开的，需要先把 USDC 转入 `io` dex（Entropy 网页或 Hyperliquid 的 dex 间划转）。OAI 等只支持逐仓，启动时会按 `venues.entropy.leverage` 设置逐仓杠杆（OAI 最高 6x）。
 Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自行确认合规。
+
+**Arcus**：`ARCUS_ACCOUNT_ADDRESS`（0x 地址）、`ARCUS_ACCOUNT_INDEX`（0–9）、`ARCUS_API_KEY`（Ed25519 公钥 hex）、`ARCUS_API_SIGNING_KEY`（对应 32 字节种子 hex）。启动时会校验公钥和种子是否匹配。杠杆/保证金模式请在 Arcus 网页设置。美股标的盘外有价格上下限（trading bounds），超出 mark 10% 的保护价会被拒绝。费率见 https://api.arcus.xyz/v1/feetiers，升级档位后请改 `venues.arcus.taker_fee_pct`。
 
 **建议**：每个交易所用专用子账户，不要手动在同一账户交易；否则对账会不一致并 HALT。
 
@@ -100,10 +134,12 @@ arb/
   config.py         配置解析与校验（两两规则、角色）
   venues/lighter.py Lighter 主网 + RH（同一实现，不同 URL/chain id/凭证前缀）
   venues/entropy.py Entropy / Hyperliquid HIP-3
+  venues/arcus.py   Arcus（Ed25519 签名 REST + WebSocket）
+  engine/claims.py  多进程之间的标的归属锁
   engine/basis.py   基差 EMA
   engine/signals.py 信号、网格线、VWAP
   engine/executor.py maker→taker 执行、增量对冲、紧急平仓
-  engine/state.py   网格仓位与残差（data/positions.json）
+  engine/state.py   网格仓位与残差（data/<交易对>/positions.json）
   engine/engine.py  主循环、决策、对账、采样
   ui.py / report.py 终端面板 / 价差统计
 tests/              单元测试（pytest）
@@ -111,7 +147,8 @@ tests/              单元测试（pytest）
 
 ## 风险与未验证项（务必先小资金）
 
-- 公共行情、价差计算、采样已对真实行情验证；**下单路径只在模拟交易所上测试过**，没有用真实凭证下过单。第一次实盘请把 `grid_value_usdc` / `order_value_usdc` 调到最小（≥ $10–15），盯盘观察。
+- 四个交易所的公共行情、价差计算、采样已对真实行情验证；**下单路径只在模拟交易所上测试过**，没有用真实凭证下过单。第一次实盘请把 `grid_value_usdc` / `order_value_usdc` 调到最小（≥ $10–15），盯盘观察。
+- Arcus 下单/撤单的签名格式沿用原仓库 `lighter-arcus-stock-trading` 里已在用的实现（post-only = `ALO`，taker = `MARKET + IOC` 带保护价）。
 - Lighter 的 taker 腿使用 `ORDER_TYPE_MARKET + IOC`（价格为最差成交价），与 SDK `create_market_order` 一致。
 - Entropy 的 `orderUpdates` 推送在 HIP-3 上若有延迟，会自动退回 REST `orderStatus` 轮询。
 - 两条 Lighter 链 / Hyperliquid 之间资金不能自动划转；某一边保证金不足时机器人只会停止开仓，需要手动调仓。

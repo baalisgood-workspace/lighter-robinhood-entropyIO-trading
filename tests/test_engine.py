@@ -65,3 +65,32 @@ def test_close_only_blocks_open(tmp_path, fake_pair):
     now = time.time()
     eng.compute(c, now)
     assert eng.decide(c, now) is None
+
+
+def test_parallel_instances_do_not_share_a_symbol(tmp_path, fake_pair):
+    import asyncio
+
+    import pytest
+
+    from arb.config import ConfigError
+    M, T = fake_pair
+    raw = {"venues": {"lighter": {"enabled": True}, "lighter_rh": {"enabled": True}},
+           "paths": {"data_dir": str(tmp_path)}, "defaults": {"basis": {"enabled": False}},
+           "symbols": {"X": {"venues": {"lighter": "X", "lighter_rh": "X"}}}}
+    cfg = parse_config(raw)
+
+    async def go():
+        e1 = Engine(cfg, {"lighter_rh": M, "lighter": T}, live=True, data_dir=tmp_path / "lighter+lighter_rh")
+        e1.build_contexts()
+        await e1.preflight()
+        assert e1.active_ctxs()
+        e2 = Engine(cfg, {"lighter_rh": M, "lighter": T}, live=True, data_dir=tmp_path / "copy")
+        e2.build_contexts()
+        with pytest.raises(ConfigError, match="owned by another"):
+            await e2.preflight()
+        await e1.shutdown()
+        e3 = Engine(cfg, {"lighter_rh": M, "lighter": T}, live=True, data_dir=tmp_path / "copy")
+        e3.build_contexts()
+        await e3.preflight()  # released on shutdown
+        await e3.shutdown()
+    asyncio.run(go())

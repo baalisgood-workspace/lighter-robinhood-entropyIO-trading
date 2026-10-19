@@ -9,6 +9,9 @@ def build_venue(cfg, env=None) -> Venue:
     if cfg.kind == "hyperliquid":
         from arb.venues.entropy import EntropyVenue
         return EntropyVenue(cfg, env=env)
+    if cfg.kind == "arcus":
+        from arb.venues.arcus import ArcusVenue
+        return ArcusVenue(cfg, env=env)
     raise VenueError(f"unknown venue kind {cfg.kind}")
 
 
