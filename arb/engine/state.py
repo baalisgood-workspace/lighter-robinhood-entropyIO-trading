@@ -24,6 +24,16 @@ class Grid:
     opened_ts: float = field(default_factory=time.time)
     # FIFO opening lots [qty, raw two-leg opening edge pct (not basis-adjusted), fill time] for the close floor
     lots: list = field(default_factory=list)
+    maker_cost: float = 0.0  # qty * avg opening price (dashboard entry prices)
+    taker_cost: float = 0.0
+
+    @property
+    def maker_entry(self) -> Optional[float]:
+        return self.maker_cost / float(self.qty) if self.qty > 0 and self.maker_cost else None
+
+    @property
+    def taker_entry(self) -> Optional[float]:
+        return self.taker_cost / float(self.qty) if self.qty > 0 and self.taker_cost else None
 
     def take_lots(self, qty: Decimal) -> list:
         """Remove `qty` FIFO from the lots; returns the removed [qty, raw, ts] parts."""
@@ -69,6 +79,8 @@ class SymbolPosition:
     residual_maker: Decimal = ZERO  # signed unhedged qty on maker venue (venue-native units)
     residual_taker: Decimal = ZERO  # signed unhedged qty on taker venue
     realized_edge_usdc: float = 0.0  # gross price capture estimate (before fees/funding)
+    n_open: int = 0
+    n_close: int = 0
     updated: float = field(default_factory=time.time)
 
     @property
@@ -93,7 +105,8 @@ class SymbolPosition:
 
     # -------------------------------------------------------------- mutations
     def add_open(self, direction: str, level: int, hedged: Decimal, target: Decimal, dev: float,
-                 raw: Optional[float] = None, ts: Optional[float] = None) -> None:
+                 raw: Optional[float] = None, ts: Optional[float] = None,
+                 maker_px: Optional[float] = None, taker_px: Optional[float] = None) -> None:
         if hedged <= 0:
             return
         if self.direction is None:
@@ -106,15 +119,23 @@ class SymbolPosition:
         g.qty += hedged
         g.open_dev_sum += dev * float(hedged)
         g.lots.append([hedged, raw, ts if ts is not None else time.time()])
+        if maker_px and taker_px:
+            g.maker_cost += maker_px * float(hedged)
+            g.taker_cost += taker_px * float(hedged)
+        self.n_open += 1
         self.updated = time.time()
 
     def reduce_close(self, hedged: Decimal) -> None:
         left = hedged
+        if hedged > 0:
+            self.n_close += 1
         while left > 0 and self.grids:
             g = self.grids[-1]
             take = min(left, g.qty)
             if g.qty > 0:
                 g.open_dev_sum -= (g.open_dev_sum / float(g.qty)) * float(take)
+                g.maker_cost -= (g.maker_cost / float(g.qty)) * float(take)
+                g.taker_cost -= (g.taker_cost / float(g.qty)) * float(take)
             g.qty -= take
             g.take_lots(take)
             left -= take
@@ -131,6 +152,8 @@ class SymbolPosition:
             self.grids[-1].qty += top.qty
             self.grids[-1].open_dev_sum += top.open_dev_sum
             self.grids[-1].lots.extend(top.lots)
+            self.grids[-1].maker_cost += top.maker_cost
+            self.grids[-1].taker_cost += top.taker_cost
 
     # -------------------------------------------------------------- json
     def to_json(self) -> dict:
@@ -145,11 +168,13 @@ class SymbolPosition:
     def from_json(cls, d: dict) -> "SymbolPosition":
         sp = cls(pair_key=d["pair_key"], symbol=d["symbol"], direction=d.get("direction"),
                  residual_maker=Decimal(d.get("residual_maker", "0")), residual_taker=Decimal(d.get("residual_taker", "0")),
-                 realized_edge_usdc=float(d.get("realized_edge_usdc", 0.0)), updated=float(d.get("updated", time.time())))
+                 realized_edge_usdc=float(d.get("realized_edge_usdc", 0.0)), updated=float(d.get("updated", time.time())),
+                 n_open=int(d.get("n_open", 0)), n_close=int(d.get("n_close", 0)))
         for g in d.get("grids", []):
             sp.grids.append(Grid(level=int(g["level"]), qty=Decimal(g["qty"]), target_qty=Decimal(g["target_qty"]),
                                  open_dev_sum=float(g.get("open_dev_sum", 0.0)), opened_ts=float(g.get("opened_ts", time.time())),
-                                 lots=[[Decimal(q), (None if r is None else float(r)), float(t)] for q, r, t in g.get("lots", [])]))
+                                 lots=[[Decimal(q), (None if r is None else float(r)), float(t)] for q, r, t in g.get("lots", [])],
+                                 maker_cost=float(g.get("maker_cost", 0.0)), taker_cost=float(g.get("taker_cost", 0.0))))
         if sp.direction not in (None, SHORT_MAKER, LONG_MAKER):
             raise ValueError(f"bad direction in state: {sp.direction}")
         return sp

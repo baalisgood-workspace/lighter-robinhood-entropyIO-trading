@@ -40,10 +40,13 @@ class Venue(ABC):
         self.generation = 0  # incremented on every market-data (re)connect
         self.book_epoch: dict[str, int] = {}  # per-symbol: bumped whenever a book is invalidated
         self.alarms: list[dict] = []  # market-health alarms drained by the engine (journal)
+        self.frames = 0  # received WS frames (dashboard throughput)
+        self.alarm_count = 0
 
     # ------------------------------------------------------------ liveness / health
     def mark_alive(self) -> None:
         self.alive_ts = time.time()
+        self.frames += 1
 
     def on_connected(self) -> None:
         self.generation += 1
@@ -54,6 +57,7 @@ class Venue(ABC):
 
     def alarm(self, kind: str, symbol: str = "", detail: str = "") -> None:
         """kind: connection_timeout | sequence_gap | generation_change | reconnect | degraded"""
+        self.alarm_count += 1
         if len(self.alarms) < 1000:
             self.alarms.append({"ts": time.time(), "venue": self.name, "kind": kind, "symbol": symbol, "detail": detail[:200]})
 

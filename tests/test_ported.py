@@ -168,3 +168,19 @@ def test_leverage_cap_blocks_open(tmp_path, fake_pair):
 def test_parallel_slices_config(tmp_path, fake_pair):
     eng, _ = make_engine(tmp_path, fake_pair, trading={"max_parallel_slices": 4})
     assert eng.cfg.max_parallel_slices == 4
+
+
+def test_dashboard_renders(tmp_path, fake_pair):
+    from rich.console import Console
+    from arb.ui import build_view
+    eng, c = make_engine(tmp_path, fake_pair)
+    now = time.time()
+    eng.compute(c, now)
+    p = eng.decide(c, now)
+    eng.apply_result(c, p, ExecResult(maker_filled=p.qty, maker_cost=p.qty * D("101"), taker_filled=p.qty,
+                                      taker_cost=p.qty * D("100")))
+    eng.halt("demo")
+    con = Console(record=True, width=200, height=50, force_terminal=True)
+    con.print(build_view(eng, 50))
+    out = con.export_text()
+    assert "套利对持仓明细" in out and "执行记录" in out and "需人工介入" in out

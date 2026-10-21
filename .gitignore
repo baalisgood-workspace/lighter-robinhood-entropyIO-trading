@@ -8,3 +8,5 @@ config/local*.yaml
 data/
 logs/
 venv/
+.upgrade_backup/
+config/config.yaml.bak-*

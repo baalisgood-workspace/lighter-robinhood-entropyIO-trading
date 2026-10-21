@@ -87,6 +87,28 @@ class Engine:
         self.started = time.time()
         self.lock_path = data / "MANUAL_INTERVENTION.json"
         self.journal_path = data / "events.jsonl"
+        # dashboard state
+        self.trades: deque[dict] = deque(maxlen=50)
+        self.last_check: dict = {}  # last reconcile: ts, ok, rows
+        self.equity0: dict[str, float] = {}
+        self.tick_ms = 0.0
+        self.tick_max_ms = 0.0
+        self.ticks = 0
+        self._load_trades()
+
+    def _load_trades(self) -> None:
+        if not self.journal_path.exists():
+            return
+        try:
+            with self.journal_path.open() as f:
+                for line in f:
+                    if '"kind": "open"' in line or '"kind": "close"' in line:
+                        try:
+                            self.trades.append(json.loads(line))
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
 
     # ------------------------------------------------------------ journal / lock
     def journal(self, kind: str, **payload) -> None:
@@ -94,6 +116,8 @@ class Engine:
         try:
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
             rec = {"ts": round(time.time(), 3), "kind": kind, "pair": self.active.key if self.active else None, **payload}
+            if kind in ("open", "close"):
+                self.trades.append(json.loads(json.dumps(rec, default=str)))
             with self.journal_path.open("a") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
         except Exception as exc:  # noqa: BLE001 - diagnostics must never break trading
@@ -193,15 +217,20 @@ class Engine:
         pm, pt = await M.positions(), await T.positions()
         self.exch_positions[M.name], self.exch_positions[T.name] = pm, pt
         problems = []
+        rows = []
         for c in self.active_ctxs():
             sp = self.position(c)
             am = pm.get(c.maker_sym).qty if c.maker_sym in pm else ZERO
             at = pt.get(c.taker_sym).qty if c.taker_sym in pt else ZERO
             tol = Decimal(str(c.sym.risk.reconcile_tolerance_mult)) * max(M.market(c.maker_sym).min_qty, T.market(c.taker_sym).min_qty)
             dm, dt = am - sp.expected_maker_qty(), at - sp.expected_taker_qty()
+            if am or at or not sp.is_flat():
+                rows.append(dict(symbol=c.sym.key, maker=am, maker_exp=sp.expected_maker_qty(), taker=at,
+                                 taker_exp=sp.expected_taker_qty(), ok=abs(dm) <= tol and abs(dt) <= tol))
             if abs(dm) > tol or abs(dt) > tol:
                 problems.append(f"{c.sym.key}: {M.name} {am} (expected {sp.expected_maker_qty()}), "
                                 f"{T.name} {at} (expected {sp.expected_taker_qty()})")
+        self.last_check = dict(ts=time.time(), ok=not problems, rows=rows, problems=problems)
         if initial and problems:
             msg = "exchange positions do not match local state:\n  " + "\n  ".join(problems)
             if not self.cfg.allow_preexisting_positions:
@@ -280,6 +309,7 @@ class Engine:
     async def _tick_loop(self) -> None:
         while not self.stopping:
             now = time.time()
+            t0 = time.perf_counter()
             for c in self.ctxs:
                 try:
                     self.compute(c, now)
@@ -300,6 +330,10 @@ class Engine:
                         self.inflight[c.key] = plan
                         self.exec_tasks[c.key] = asyncio.create_task(self._execute(c, plan))
             self._drain_alarms()
+            ms = (time.perf_counter() - t0) * 1000
+            self.ticks += 1
+            self.tick_ms = ms if self.ticks == 1 else self.tick_ms * 0.95 + ms * 0.05
+            self.tick_max_ms = max(self.tick_max_ms * 0.999, ms)
             await asyncio.sleep(0.1)
 
     async def _persist_loop(self) -> None:
@@ -320,6 +354,7 @@ class Engine:
                     if v and (self.live or v.has_credentials()):
                         try:
                             self.balances[n] = await v.balance()
+                            self.equity0.setdefault(n, float(self.balances[n].equity))
                         except Exception as exc:  # noqa: BLE001
                             log.debug("balance %s: %s", n, exc)
             rec_iv = min((c.sym.risk.reconcile_interval_s for c in self.active_ctxs()), default=30.0)
@@ -637,7 +672,9 @@ class Engine:
         pnl = None
         if plan.kind == "open":
             if hedged > 0:
-                sp.add_open(sg.POSITION_OF[plan.direction], plan.level, hedged, plan.target or hedged, dev or 0.0, raw=raw)
+                sp.add_open(sg.POSITION_OF[plan.direction], plan.level, hedged, plan.target or hedged, dev or 0.0, raw=raw,
+                            maker_px=float(res.maker_avg) if res.maker_avg else None,
+                            taker_px=float(res.taker_avg) if res.taker_avg else None)
         else:
             if hedged > 0 and sp.grids:
                 g = sp.grids[-1]
