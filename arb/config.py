@@ -60,6 +60,7 @@ class VenueConfig:
     dex: str = "io"  # entropy only: HIP-3 dex name
     leverage: int = 3  # entropy only: isolated leverage set at start in live mode
     funding_poll_seconds: float = 60.0
+    unknown_lookup_s: float = 20.0  # IOC with ambiguous send result: keep looking it up this long before halting
     liveness_s: float = 5.0  # WS: protocol ping every liveness/2; any received frame counts as alive
     quick_resume_s: float = 10.0  # WS: socket closed when silent for liveness + quick_resume
 
@@ -82,6 +83,9 @@ class StrategyConfig:
     # realised raw spread of its opening fills + the closing quote >= min_close_profit_pct (before fees).
     min_close_profit_pct: Optional[float] = 0.01  # null disables the floor
     close_floor_timeout_s: float = 600.0
+    # signal persistence (lighter-rh spread_persistence_seconds): join/improve modes open only after the
+    # edge stayed above the trigger continuously for this many seconds. 0 = immediately (previous behaviour)
+    signal_confirm_s: float = 0.0
 
 
 @dataclass
@@ -149,6 +153,45 @@ class RiskConfig:
     max_leverage: float = 2.0  # gross notional on a venue (this instance) / venue equity
     reserve_ratio: float = 0.02  # keep this share of equity unused
     max_unhedged_notional_usdc: float = 500.0  # residual (unhedged) notional above this blocks new opens
+    # ---- ported from lighter-rh (open-only blocks: closes keep working)
+    volatility_max_pct: Optional[float] = 4.0  # (max-min)/min of the mid within the window >= this blocks opens
+    volatility_window_s: float = 300.0
+    volatility_block_s: float = 900.0
+    max_leg_spread_pct: Optional[float] = None  # own bid-ask spread of either leg above this blocks opens
+    max_daily_opens: Optional[int] = None  # open slices per UTC day per symbol
+    reduce_only_block_s: float = 1800.0  # venue rejected an opening order with "reduce only": block opens this long
+    max_hold_hours: Optional[float] = None  # warn (UI/event) when the oldest grid is older than this
+
+
+@dataclass
+class GuardsConfig:
+    """Instance-wide pauses and alerts (ported from lighter-rh global risk control)."""
+    bell: bool = True  # terminal bell on halt / pause / alert (throttled)
+    bell_min_interval_s: float = 60.0
+    # slippage pause: realised edge - required edge <= -slippage_pause_pct on a hedged slice
+    slippage_pause_pct: Optional[float] = 0.08  # null disables
+    slippage_pause_s: float = 900.0
+    slippage_burst_count: int = 5  # this many slices with slippage <= -0.01% within the window also pause
+    slippage_burst_window_s: float = 180.0
+    slippage_pause_scope: str = "all"  # all = every symbol of this instance | symbol = only the affected one
+    # hedge latency pause: taker IOC submit -> final state slower than this pauses new slices
+    hedge_latency_max_s: Optional[float] = 3.2  # null disables
+    hedge_latency_pause_s: float = 1000.0
+    # venue error backoff: HTTP 429 / rate limit / invalid nonce -> pause that venue base*2^(n-1) seconds
+    backoff_base_s: float = 10.0
+    backoff_max_s: float = 300.0
+    backoff_reset_s: float = 600.0  # error streak forgotten after this quiet time
+    # API failure pause (transport errors / HTTP 5xx / timeouts) within a rolling window
+    api_failure_pause: bool = False
+    api_failure_count: int = 10
+    api_failure_window_s: float = 600.0
+    api_failure_pause_s: float = 900.0
+    # alerts (never trade by themselves)
+    equity_gap_warn_usdc: Optional[float] = 1000.0  # equity difference between the two venues
+    equity_gap_interval_s: float = 300.0
+    balance_warn_usdc: Optional[float] = None  # equity of a venue below this -> warning
+    adverse_funding_warn_hours: Optional[float] = 8.0  # held position with adverse funding this long -> warning
+    adverse_funding_warn_hourly_pct: float = 0.01
 
 
 @dataclass
@@ -201,6 +244,7 @@ class AppConfig:
     sampler_interval_s: float = 5.0
     max_parallel_slices: int = 1  # concurrent maker slices (different symbols) per instance
     ui_refresh_s: float = 1.0
+    guards: GuardsConfig = field(default_factory=GuardsConfig)
     source: str = ""
 
     def enabled_venues(self) -> list[str]:
@@ -263,7 +307,7 @@ def load_config(path: str | Path, overrides: Optional[dict] = None) -> AppConfig
 
 def parse_config(raw: dict) -> AppConfig:
     raw = copy.deepcopy(raw)
-    allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s", "ui_refresh_s"}
+    allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s", "ui_refresh_s", "guards"}
     unknown = {k for k in set(raw) - allowed_top if not str(k).startswith("x-")}  # x-*: YAML anchors
     if unknown:
         raise ConfigError(f"unknown top-level keys: {sorted(unknown)}")
@@ -331,6 +375,7 @@ def parse_config(raw: dict) -> AppConfig:
         log_dir=str(paths.get("log_dir", "logs")),
         sampler_interval_s=float(raw.get("sampler_interval_s", 5.0)),
         ui_refresh_s=float(raw.get("ui_refresh_s", 1.0)),
+        guards=_build(GuardsConfig, raw.get("guards") or {}, "guards"),
     )
     errors = validate(cfg)
     if errors:
@@ -353,6 +398,13 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"venues.{v.name}: maker_fee_pct/taker_fee_pct are required")
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):
             errs.append(f"venues.{v.name}.leverage must be 1..50")
+    g = cfg.guards
+    if g.slippage_pause_scope not in ("all", "symbol"):
+        errs.append("guards.slippage_pause_scope must be all or symbol")
+    if g.backoff_base_s <= 0 or g.backoff_max_s < g.backoff_base_s:
+        errs.append("guards: need 0 < backoff_base_s <= backoff_max_s")
+    if g.api_failure_count < 1 or g.slippage_burst_count < 0:
+        errs.append("guards: api_failure_count >= 1, slippage_burst_count >= 0")
     if not (1 <= cfg.max_parallel_slices <= 32):
         errs.append("trading.max_parallel_slices must be 1..32")
     for v in cfg.venues.values():
@@ -375,6 +427,14 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}: session must be 24x7 or us_equity")
         if st.offhours_threshold_pct is not None and st.offhours_threshold_pct <= 0:
             errs.append(f"{p}: offhours_threshold_pct must be > 0")
+        if st.signal_confirm_s < 0:
+            errs.append(f"{p}.strategy.signal_confirm_s must be >= 0")
+        if rk.volatility_max_pct is not None and (rk.volatility_max_pct <= 0 or rk.volatility_window_s <= 0 or rk.volatility_block_s < 0):
+            errs.append(f"{p}.risk: volatility_max_pct/volatility_window_s must be > 0")
+        if rk.max_leg_spread_pct is not None and rk.max_leg_spread_pct <= 0:
+            errs.append(f"{p}.risk.max_leg_spread_pct must be > 0 or null")
+        if rk.max_daily_opens is not None and rk.max_daily_opens < 1:
+            errs.append(f"{p}.risk.max_daily_opens must be >= 1 or null")
         if st.grid_value_usdc * st.max_grids > rk.max_symbol_value_usdc + 1e-9:
             errs.append(f"{p}: grid_value_usdc*max_grids exceeds risk.max_symbol_value_usdc")
         if b.enabled:
@@ -414,13 +474,16 @@ US_HOLIDAYS = {
     "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05",
     "2027-09-06", "2027-11-25", "2027-12-24",
 }
+US_EARLY_CLOSES = {"2026-11-27": dtime(13, 0), "2026-12-24": dtime(13, 0), "2027-11-26": dtime(13, 0)}
+US_CALENDAR_YEARS = {2026, 2027}  # other years: treated as off-hours (higher threshold) until the calendar is extended
 
 
 def us_regular_hours(ts: Optional[float] = None) -> bool:
     now = datetime.now(_NY) if ts is None else datetime.fromtimestamp(ts, _NY)
-    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in US_HOLIDAYS:
+    day = now.strftime("%Y-%m-%d")
+    if now.year not in US_CALENDAR_YEARS or now.weekday() >= 5 or day in US_HOLIDAYS:
         return False
-    return dtime(9, 30) <= now.time() < dtime(16, 0)
+    return dtime(9, 30) <= now.time() < US_EARLY_CLOSES.get(day, dtime(16, 0))
 
 
 def effective_t1(st: StrategyConfig, ts: Optional[float] = None) -> float:

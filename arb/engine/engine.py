@@ -18,6 +18,7 @@ from arb.engine import signals as sg
 from arb.engine.basis import BasisBook, BasisState
 from arb.engine.claims import Claims
 from arb.engine.executor import ExecPlan, ExecResult, Executor
+from arb.engine.guards import Guards
 from arb.engine.state import PositionBook, SymbolPosition
 from arb.models import Balance, Position
 from arb.venues.base import Venue
@@ -53,6 +54,17 @@ class Ctx:
     epochs: tuple = ()
     ready_s: float = 0.0  # cumulated seconds with a tradable (ready) quote, for uptime stats
     last_tick: float = 0.0
+    # guards (arb/engine/guards.py)
+    vol_mids: deque = field(default_factory=deque)  # (ts, taker mid), at most one sample per second
+    vol_amp: float = 0.0
+    vol_block_until: float = 0.0
+    ro_block_until: float = 0.0
+    signal_since: Optional[float] = None
+    pause_reason: str = ""
+    opens_day: str = ""
+    opens_today: int = 0
+    adverse_since: Optional[float] = None
+    warn: str = ""
 
     @property
     def key(self) -> str:
@@ -94,6 +106,8 @@ class Engine:
         self.tick_ms = 0.0
         self.tick_max_ms = 0.0
         self.ticks = 0
+        self.guards = Guards(self)
+        self.pause_text = ""  # active instance-wide pause (dashboard)
         self._load_trades()
 
     def _load_trades(self) -> None:
@@ -232,6 +246,7 @@ class Engine:
                                 f"{T.name} {at} (expected {sp.expected_taker_qty()})")
         self.last_check = dict(ts=time.time(), ok=not problems, rows=rows, problems=problems)
         if initial and problems:
+            self.journal("startup_position_mismatch", problems=problems, rows=rows)
             msg = "exchange positions do not match local state:\n  " + "\n  ".join(problems)
             if not self.cfg.allow_preexisting_positions:
                 raise ConfigError(msg + "\nUse dedicated accounts, flatten manually, or set trading.allow_preexisting_positions: true.")
@@ -319,7 +334,9 @@ class Engine:
             for k in [k for k, t in self.exec_tasks.items() if t.done()]:
                 self.exec_tasks.pop(k)
                 self.inflight.pop(k, None)
-            if self.live and not self.halted and not self.stopping and not self.reconcile_due:
+            self.guards.tick(now)
+            self.pause_text = self.guards.global_reason(now)
+            if self.live and not self.halted and not self.stopping and not self.reconcile_due and not self.pause_text:
                 for c in self.active_ctxs():
                     if len(self.exec_tasks) >= self.cfg.max_parallel_slices:
                         break
@@ -357,6 +374,7 @@ class Engine:
                             self.equity0.setdefault(n, float(self.balances[n].equity))
                         except Exception as exc:  # noqa: BLE001
                             log.debug("balance %s: %s", n, exc)
+                self.guards.on_balances(now)
             rec_iv = min((c.sym.risk.reconcile_interval_s for c in self.active_ctxs()), default=30.0)
             if self.live and self.active and now - last_rec >= rec_iv:
                 self.reconcile_due = True  # stop launching slices; reconcile once the running ones are done
@@ -435,6 +453,7 @@ class Engine:
             dq.append((now, v))
             while dq and dq[0][0] < now - rk.stability_window_s:
                 dq.popleft()
+        self.guards.observe(c, now, tm)
         if c.basis:
             c.basis.observe(now, sg.basis_value(mb.mid, tb.mid))
             c.basis_value = c.basis.ema or 0.0
@@ -462,6 +481,14 @@ class Engine:
         M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
         tt = c.sym.execution.close_mode == "taker_taker"
         return sg.roundtrip_fee_pct(M.maker_fee_pct(c.maker_sym), T.taker_fee_pct(c.taker_sym), tt, M.taker_fee_pct(c.maker_sym))
+
+    def _funding_hourly(self, c: Ctx, direction: str) -> Optional[float]:
+        """Adverse funding of holding `direction`, percent per hour (None if a rate is unknown)."""
+        M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
+        rm, rt = M.funding_hourly.get(c.maker_sym), T.funding_hourly.get(c.taker_sym)
+        if rm is None or rt is None:
+            return None
+        return sg.adverse_funding_pct(direction, rm, rt, 1.0)
 
     def _funding(self, c: Ctx, direction: str) -> float:
         M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
@@ -491,7 +518,10 @@ class Engine:
         c.next_open = c.next_close = None
         if c.disabled or not c.ready or c.q_sell is None or c.q_buy is None:
             return None
-        if now < c.paused_until or now < c.cooldown_until:
+        if now < c.paused_until:
+            c.status = f"paused {c.paused_until - now:.0f}s" + (f": {c.pause_reason}" if c.pause_reason else "")
+            return None
+        if now < c.cooldown_until:
             return None
         M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
         st, rk, ex = c.sym.strategy, c.sym.risk, c.sym.execution
@@ -577,8 +607,16 @@ class Engine:
         else:
             opens = [x for x in cands if x[1].kind == "open" and x[0] <= 0]
             if not opens:
+                c.signal_since = None
                 return None
             gap, plan = min(opens, key=lambda x: x[0])
+            if st.signal_confirm_s > 0:  # spread persistence: the signal must hold continuously
+                if c.signal_since is None:
+                    c.signal_since = now
+                held = now - c.signal_since
+                if held < st.signal_confirm_s:
+                    c.status = f"signal confirming {held:.1f}/{st.signal_confirm_s:g}s"
+                    return None
         if not self._stable(c):
             c.status = f"{plan.kind} signal, prices unstable"
             return None
@@ -602,6 +640,9 @@ class Engine:
         sp = self.position(c)
         ok, why = self._balances_ok(c, now)
         if not ok:
+            return why
+        why = self.guards.open_block(c, now)
+        if why:
             return why
         px = float(max(M.book(c.maker_sym).mid, T.book(c.taker_sym).mid))
         if float(sp.total_qty + plan.qty) * px > rk.max_symbol_value_usdc * 1.0001:
@@ -693,12 +734,14 @@ class Engine:
                     pnl = (wr / wq + raw) / 100 * float(hedged) * px  # gross two-leg, before fees/funding
             sp.reduce_close(hedged)
         self.positions.save()
+        slip = self.guards.on_result(c, plan, res, dev)
         self.journal(plan.kind, symbol=c.sym.key, direction=plan.direction, level=plan.level, qty=plan.qty,
                      maker_filled=res.maker_filled, maker_avg=res.maker_avg, taker_filled=res.taker_filled,
                      taker_avg=res.taker_avg, hedged=hedged, carry_in=res.carry_in, raw_edge=raw, adj_edge=dev,
                      required=plan.required_dev, floor=plan.required_raw, gross_pnl_usdc=pnl, note=res.note,
                      requotes=res.requotes, hedge_orders=res.hedge_orders, zero_fill_hedges=res.zero_fill_hedges,
-                     unwound=res.maker_unwound, error=res.error or None,
+                     unwound=res.maker_unwound, error=res.error or None, slippage=slip,
+                     hedge_latency_s=round(max(res.hedge_latencies), 3) if res.hedge_latencies else None,
                      residual_maker=sp.residual_maker, residual_taker=sp.residual_taker)
         msg = (f"{plan.kind} {c.sym.key}: maker {res.maker_filled}@{_f(res.maker_avg)} taker {res.taker_filled}@{_f(res.taker_avg)}"
                f" hedged={hedged} edge={_f(dev)}% {res.note}")
@@ -727,6 +770,8 @@ class Engine:
                 if r == 0:
                     continue
                 v = self.venues[vname]
+                if self.guards.venue_paused(vname, time.time()):
+                    continue  # venue in rate-limit / API backoff
                 qty = v.round_qty(sym, abs(r))
                 b = v.book(sym)
                 if not b or not b.is_valid() or qty < v.market(sym).min_qty or qty * b.mid < v.market(sym).min_notional:

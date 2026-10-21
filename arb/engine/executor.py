@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Callable, Optional
@@ -81,6 +82,7 @@ class ExecResult:
     zero_fill_hedges: int = 0
     requotes: int = 0
     events: list[str] = field(default_factory=list)
+    hedge_latencies: list[float] = field(default_factory=list)  # taker IOC submit -> final, seconds
 
     @property
     def maker_avg(self) -> Optional[Decimal]:
@@ -192,8 +194,11 @@ class Executor:
         zero = orders = stale = 0
         # retry budget: only confirmed zero-filled terminal IOCs count; positive partials keep going
         while remaining > 0 and zero < ex.hedge_max_attempts and orders < ex.hedge_max_orders:
+            t0 = time.monotonic()
             st = await self._ioc(T, plan.taker_sym, taker_buy, remaining, plan.reduce_only,
                                  ex.hedge_slippage_pct + zero * ex.hedge_slippage_step_pct, plan.sym.risk.max_quote_age_s)
+            if st is not None:
+                res.hedge_latencies.append(time.monotonic() - t0)
             if st is None:  # taker book stale: nothing was sent
                 stale += 1
                 if stale > 20:

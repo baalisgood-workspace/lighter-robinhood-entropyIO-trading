@@ -54,6 +54,31 @@ trading:
   allow_preexisting_positions: false
   max_parallel_slices: 1         # >1: quote several symbols at once (recommended with maker_price_mode: threshold)
 
+# v4 (ported from lighter-rh global risk control): instance-wide pauses stop NEW slices (opens and closes)
+# for a while; they never touch positions. Alerts only warn (event log, dashboard, terminal bell). null disables.
+guards:
+  bell: true                     # terminal bell on pauses / warnings
+  bell_min_interval_s: 60
+  slippage_pause_pct: 0.08       # realised dev - required dev <= -0.08% on one slice -> pause
+  slippage_pause_s: 900
+  slippage_burst_count: 5        # or this many slices with slippage <= -0.01% ...
+  slippage_burst_window_s: 180   # ... within this window -> pause (0 count disables)
+  slippage_pause_scope: all      # all: pause the whole instance | symbol: only that symbol
+  hedge_latency_max_s: 3.2       # a taker hedge IOC took longer (submit -> final) -> pause
+  hedge_latency_pause_s: 1000
+  backoff_base_s: 10             # HTTP 429 / rate limit / invalid nonce -> pause base * 2^(n-1) ...
+  backoff_max_s: 300             # ... capped; the counter resets after backoff_reset_s without errors
+  backoff_reset_s: 600
+  api_failure_pause: false       # true: pause after api_failure_count transport errors / 5xx / timeouts in the window
+  api_failure_count: 10
+  api_failure_window_s: 600
+  api_failure_pause_s: 900
+  equity_gap_warn_usdc: 1000     # warn when the two venues' equity differs by more (funds never move automatically)
+  equity_gap_interval_s: 300
+  balance_warn_usdc: null        # e.g. 500: warn when a venue's equity drops below
+  adverse_funding_warn_hours: 8  # warn when funding has been against the open position this long ...
+  adverse_funding_warn_hourly_pct: 0.01  # ... at >= this net %/h
+
 paths:
   data_dir: data
   log_dir: logs
@@ -73,6 +98,7 @@ defaults:
     # close_floor_timeout_s only closes if opening raw spread + closing raw spread >= min_close_profit_pct
     min_close_profit_pct: 0.01   # null disables
     close_floor_timeout_s: 600
+    signal_confirm_s: 0          # >0: an open signal must hold continuously this long (spread persistence; join/improve modes)
   basis:
     enabled: true
     ema_seconds: 3600
@@ -99,6 +125,14 @@ defaults:
     max_leverage: 2              # gross notional per venue / (equity * (1 - reserve_ratio))
     reserve_ratio: 0.02
     max_unhedged_notional_usdc: 500
+    # v4 (ported from lighter-rh): open-only blocks - closes keep working
+    volatility_max_pct: 4.0      # mid range (max-min)/min over volatility_window_s >= this -> no opens; null disables
+    volatility_window_s: 300
+    volatility_block_s: 900
+    reduce_only_block_s: 1800    # venue rejected an open as reduce-only -> no opens on this symbol for this long
+    max_leg_spread_pct: null     # e.g. 0.1: no opens while the taker book spread (bid/ask) is wider than this
+    max_daily_opens: null        # e.g. 20: max hedged open slices per symbol per UTC day
+    max_hold_hours: null         # e.g. 72: warn (dashboard + bell) when the oldest grid is older; never auto-closes
 
 # symbol key -> market name on each venue. A symbol trades on a pair only if both venues list it.
 # Arcus names are "<BASE>-USD". Arcus has no OPENAI/ANTHROPIC.

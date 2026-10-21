@@ -212,6 +212,68 @@ async def _positions(cfg: AppConfig) -> int:
     return 0
 
 
+async def _accept_flat(cfg: AppConfig, confirm: bool) -> int:
+    """Operator tool (ported from arcus-maker-lighter-taker operator_resolve_hedge --accept-flat): after the
+    position was closed by hand, reset the local grids of a symbol to flat - only when BOTH venues show
+    no position and no resting order for it. Dry run unless --confirm."""
+    import json
+    from arb.engine.state import PositionBook, SymbolPosition
+    from arb.venues import build_venue
+    pair = cfg.active_pair()
+    d = instance_dir(cfg, True)
+    book = PositionBook(d / "positions.json")
+    open_sps = [sp for sp in book.items.values() if sp.pair_key == pair.key and not sp.is_flat()]
+    if not open_sps:
+        print(f"{d / 'positions.json'}: no open grids for {pair.key}")
+        return 0
+    missing = [n for n in (pair.maker, pair.taker) if not _creds_present(cfg, n)]
+    if missing:
+        print(f"missing credentials for {missing}", file=sys.stderr)
+        return 2
+    venues = {}
+    actual: dict[str, dict] = {}
+    try:
+        for n in (pair.maker, pair.taker):
+            v = build_venue(cfg.venues[n])
+            await v.start(cfg.symbols_for_venue(n), trading=False)
+            venues[n] = v
+            actual[n] = await v.positions()
+    finally:
+        await _stop_venues(venues)
+    ok = []
+    for sp in open_sps:
+        sc = cfg.symbols.get(sp.symbol)
+        if sc is None:
+            print(f"  {sp.symbol}: not in config, skipped")
+            continue
+        qm = actual[pair.maker].get(sc.venues[pair.maker])
+        qt = actual[pair.taker].get(sc.venues[pair.taker])
+        qm = qm.qty if qm else 0
+        qt = qt.qty if qt else 0
+        local = f"local maker {sp.expected_maker_qty()} / taker {sp.expected_taker_qty()}"
+        if qm == 0 and qt == 0:
+            ok.append(sp)
+            print(f"  {sp.symbol}: both venues flat, {local} -> will reset to flat")
+        else:
+            print(f"  {sp.symbol}: NOT flat on the venues ({pair.maker} {qm}, {pair.taker} {qt}; {local}) - unchanged")
+    if not ok:
+        return 1
+    if not confirm:
+        print("dry run: nothing written (add --confirm; make sure no order is resting for these symbols)")
+        return 0
+    for sp in ok:
+        fresh = SymbolPosition(pair_key=sp.pair_key, symbol=sp.symbol, realized_edge_usdc=sp.realized_edge_usdc,
+                               n_open=sp.n_open, n_close=sp.n_close)
+        book.items[PositionBook.key(sp.pair_key, sp.symbol)] = fresh
+    book.save()
+    with (d / "events.jsonl").open("a") as f:
+        for sp in ok:
+            f.write(json.dumps({"ts": time.time(), "kind": "operator_accept_flat", "pair": pair.key, "symbol": sp.symbol,
+                                "previous": sp.to_json()}, default=str) + "\n")
+    print(f"reset {len(ok)} symbol(s) to flat in {d / 'positions.json'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arb", description="Lighter / Lighter-RH / Entropy (io) / Arcus maker->taker spread arbitrage (one pair per process)")
     ap.add_argument("--config", default="config/config.yaml")
@@ -236,9 +298,17 @@ def main(argv: list[str] | None = None) -> int:
     common(sub.add_parser("positions", help="show exchange balances/positions and local state"))
     ul = common(sub.add_parser("unlock", help="clear the manual-intervention lock of a pair after you fixed it"))
     ul.add_argument("--yes", action="store_true")
+    af = common(sub.add_parser("accept-flat", help="reset local grids to flat when BOTH venues are verifiably flat (manual close)"))
+    af.add_argument("--confirm", action="store_true", help="write the change (default: dry run)")
+    mk = sub.add_parser("markets", help="which symbols are listed on which venue (public, read-only)")
+    mk.add_argument("--symbols", help="comma list to show only these")
+    mk.add_argument("--min-venues", type=int, default=2)
+    mk.add_argument("--yaml", action="store_true", help="print config snippets for listed symbols that are not configured")
     r = sub.add_parser("report", help="spread statistics from recorded samples")
     r.add_argument("--threshold", type=float, default=0.30)
     r.add_argument("--days", help="comma list of YYYY-MM-DD")
+    r.add_argument("--chart", action="store_true", help="also write PNG charts to data/charts/ (needs matplotlib)")
+    r.add_argument("--symbols", help="comma list for --chart")
     args = ap.parse_args(argv)
 
     try:
@@ -255,7 +325,21 @@ def main(argv: list[str] | None = None) -> int:
         days = args.days.split(",") if args.days else None
         rc = print_report(Path(cfg.data_dir), args.threshold, days)
         print_trades(Path(cfg.data_dir))
+        if args.chart:
+            from arb.report import write_charts
+            try:
+                files = write_charts(Path(cfg.data_dir), Path(cfg.data_dir) / "charts", args.threshold, days,
+                                     args.symbols.split(",") if args.symbols else None)
+            except RuntimeError as exc:
+                print(f"chart: {exc}", file=sys.stderr)
+                return 2
+            print(f"\n{len(files)} chart(s) written to {Path(cfg.data_dir) / 'charts'}")
         return rc
+    if args.cmd == "markets":
+        from arb.markets import fetch_all, render
+        listing = asyncio.run(fetch_all(cfg))
+        print(render(cfg, listing, args.symbols.split(",") if args.symbols else None, args.min_venues, args.yaml))
+        return 0
     if args.cmd == "unlock":
         try:
             lock = instance_dir(cfg, True) / "MANUAL_INTERVENTION.json"
@@ -279,6 +363,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "positions":
         return asyncio.run(_positions(cfg))
+    if args.cmd == "accept-flat":
+        try:
+            with _lock(instance_dir(cfg, True)):
+                return asyncio.run(_accept_flat(cfg, args.confirm))
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     live = args.cmd == "live"
     if live:

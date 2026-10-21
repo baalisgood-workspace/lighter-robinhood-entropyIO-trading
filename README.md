@@ -151,6 +151,53 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v4：从 lighter-rh / arcus-maker-lighter-taker v8–v17 移植
+
+以下功能来自 `baalisgood/lighter-rh`（arbitrage_monitor_v2 的全局风控 / 分段网格配置）和 `baalisgood/arcus-maker-lighter-taker`（v8–v17，main @18b02e4），改写为四交易所通用实现，原有功能与仪表盘全部保留。新代码集中在 `arb/engine/guards.py`，便于继续扩展。
+
+**全局暂停（停止本实例所有新切片，不动仓位，到期自动恢复）** —— `guards:` 段，默认开启：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `slippage_pause_pct` / `slippage_pause_s` | 0.08 / 900 | 单笔实际 dev − 所需 dev ≤ −0.08% → 暂停 900s |
+| `slippage_burst_count` / `slippage_burst_window_s` | 5 / 180 | 180s 内 5 笔滑点 ≤ −0.01% → 暂停 |
+| `slippage_pause_scope` | all | `all` 整个实例 / `symbol` 只停该标的 |
+| `hedge_latency_max_s` / `hedge_latency_pause_s` | 3.2 / 1000 | 对冲 IOC 从提交到终态超过 3.2s → 暂停 |
+| `backoff_base_s` / `backoff_max_s` / `backoff_reset_s` | 10 / 300 / 600 | HTTP 429 / 限流 / nonce 错误 → 指数退避暂停（10→20→40…≤300s，600s 无错误重置） |
+| `api_failure_pause`（默认关）/ `api_failure_count` / `_window_s` / `_pause_s` | false / 10 / 600 / 900 | 5xx / 超时 / 连接错误在窗口内达到次数 → 暂停 |
+
+**只禁开仓（平仓照常）** —— `risk:` 段，可按标的覆盖：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `volatility_max_pct` / `volatility_window_s` / `volatility_block_s` | 4.0 / 300 / 900 | 300s 内中间价振幅 ≥ 4% → 禁开 900s |
+| `reduce_only_block_s` | 1800 | 交易所以“只减仓”拒绝开仓 → 该标的禁开 1800s |
+| `max_leg_spread_pct` | null（关） | taker 腿盘口点差超过此值不开仓 |
+| `max_daily_opens` | null（关） | 每标的每 UTC 日最多开仓切片数 |
+| `strategy.signal_confirm_s` | 0（关） | 开仓信号需连续保持 N 秒（价差持续性确认，join/improve 模式） |
+
+**只提醒（事件日志 + 仪表盘“风险提醒” + 终端响铃 `bell`）**：两所权益差 ≥ `equity_gap_warn_usdc`（1000U，每 300s 提醒一次，资金不会自动划转）、单所权益 < `balance_warn_usdc`（默认关）、持仓超过 `risk.max_hold_hours`（默认关，不会自动平仓）、资金费率持续不利 ≥ `adverse_funding_warn_hours`（8h，净 ≥ 0.01%/h）。
+
+**下单/订单状态安全（arcus-maker-lighter-taker v8–v17）**：
+
+1. Lighter：签名阶段（尚未发送）抛出的异常判定为“未发送”→ 直接拒绝并强制刷新 nonce；HTTP 4xx（非 429）判定为拒绝并刷新 nonce；只有真正发出后结果不明才是 UNKNOWN，并继续查询最长 `venues.<名>.unknown_lookup_s`（20s）再决定是否 HALT。
+2. Arcus：请求被拒时交易所推送的“零值 REJECTED”行（size 0 / market 0）只在订单仅有下单 ACK、无成交、未发撤单时才判定为订单被拒；否则（通常是撤单被拒、订单刚成交）不合并，改为 REST 重新读取真实状态。orderId / marketId 与本单矛盾的行（其他会话复用了 clientId）一律忽略并告警；零 size 的状态行不当作数量证据。
+3. 所有交易所：限流 / nonce / 传输错误统一分类记录（`venue.failures`），驱动上面的退避暂停；残差修复会跳过处于退避中的交易所。
+4. 美股交易时段：加入提前收盘日（感恩节次日、平安夜 13:00）；日历只维护到 2027 年，之后的年份一律按盘外（更高阈值）处理。
+5. 启动对账不一致、滑点、对冲延迟、暂停/恢复都会写入 `events.jsonl`。
+
+**仪表盘新增**：标题“套利执行终端 v4”；性能区“对冲延迟（p50/最大）”“成交滑点（近 20 笔均值/最差）”；风控区“暂停新单：原因（剩余 Ns）”和“风险提醒”；行情区状态显示“暂停 / 信号确认中 / 禁开原因 / ⚠提醒”；执行记录新增“滑点%”列。
+
+**新命令**：
+
+```bash
+python -m arb markets [--symbols SNDK,MU] [--min-venues 2] [--yaml]   # 列出四所共同上市的标的，--yaml 输出可粘贴的 symbols 配置
+python -m arb accept-flat --venues lighter,arcus [--confirm]          # 两边交易所确认已空仓后清空本地网格账本（默认只预览）
+python -m arb report --chart [--symbols SNDK]                          # 价差/基差图 PNG 写入 data/charts/（需 pip install matplotlib，可选）
+```
+
+**未移植（说明原因）**：自动仓位对齐下单（自动补单风险大，本项目保持“HALT + 人工介入锁”）、低余额 / 最大亏损时强制平仓、WebSocket 批量下单、Lighter modify_order 改单、系统声音（改用终端响铃）、lighter-rh 的 100k 行监控框架本身（只取其风控规则与参数）。
+
 ## 监控面板（中文仪表盘）
 
 `monitor` / `live` 在终端（TTY）下会全屏显示中文仪表盘，每秒刷新：
@@ -185,6 +232,8 @@ arb/
   engine/executor.py maker→taker 执行、阈值挂单、增量对冲、碎单累积
   engine/state.py   网格仓位与残差（data/<交易对>/positions.json）
   engine/engine.py  主循环、决策、对账、采样
+  engine/guards.py  v4 全局暂停 / 禁开 / 提醒（滑点、延迟、限流退避、波动…）
+  markets.py        四所共同标的列表（arb markets）
   ui.py / report.py 终端面板 / 价差统计
 tests/              单元测试（pytest）
 ```

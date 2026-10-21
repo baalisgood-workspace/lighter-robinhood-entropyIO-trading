@@ -86,7 +86,7 @@ def _system_panel(eng: Engine):
     from rich.text import Text
     now = time.time()
     t = Text()
-    t.append("套利执行终端 v3\n", style="bold")
+    t.append("套利执行终端 v4\n", style="bold")
     if eng.live:
         t.append("运行模式：", style="cyan")
         t.append("实盘模式（执行真实订单）\n", style="bold yellow")
@@ -128,6 +128,12 @@ def _perf_panel(eng: Engine):
     t.append(f"{running}/{eng.cfg.max_parallel_slices}" + ("（对账中）" if eng.reconcile_due else "") + "\n")
     t.append("健康告警：", style="cyan")
     t.append("  ".join(f"{n}={v.alarm_count}" for n, v in eng.venues.items()) + "\n")
+    p50, mx = eng.guards.latency_stats()
+    t.append("对冲延迟：", style="cyan")
+    t.append("暂无\n" if p50 is None else f"p50 {p50:.2f}s  最大 {mx:.2f}s  ({len(eng.guards.hedge_lat)} 笔)\n")
+    sl = list(eng.guards.slips)[-20:]
+    t.append("成交滑点：", style="cyan")
+    t.append("暂无\n" if not sl else f"近{len(sl)}笔均值 {sum(sl) / len(sl):+.3f}%  最差 {min(sl):+.3f}%\n")
     t.append("UI 刷新：", style="cyan")
     t.append(f"{max(0.25, eng.cfg.ui_refresh_s):.1f} 秒/次")
     return t
@@ -139,6 +145,8 @@ def _risk_panel(eng: Engine):
     t.append("状态：", style="cyan")
     if eng.halted:
         t.append("已停止（需人工介入）\n", style="bold red")
+    elif eng.pause_text:
+        t.append(f"暂停新单：{eng.pause_text}\n", style="bold yellow")
     elif eng.cfg.close_only:
         t.append("仅平仓\n", style="yellow")
     else:
@@ -180,7 +188,10 @@ def _risk_panel(eng: Engine):
                 lev.append(f"{n} {gross_n:.0f}U")
         t.append("总名义/杠杆：", style="cyan")
         t.append(" | ".join(lev) + "\n")
-    blocked = [c.sym.key for c in eng.active_ctxs() if c.status.startswith("blocked")]
+    alerts = list(eng.guards.alerts.values()) + [f"{c.sym.key} {c.warn}" for c in eng.active_ctxs() if c.warn]
+    t.append("风险提醒：", style="cyan")
+    t.append(("；".join(alerts[:4]) + "\n") if alerts else "无\n", style="yellow" if alerts else "green")
+    blocked = [c.sym.key for c in eng.active_ctxs() if c.status.startswith(("blocked", "paused"))]
     t.append("开仓限制：", style="cyan")
     if eng.halted:
         t.append(f"全部禁止：{eng.halted}\n", style="red")
@@ -214,7 +225,7 @@ def _book_table(eng: Engine, max_rows: int):
         fm, ft = M.funding_hourly.get(c.maker_sym), T.funding_hourly.get(c.taker_sym)
         diff = "-" if fm is None or ft is None else f"{(ft - fm) * HOURS_PER_YEAR * 100:+.1f}%"
         active = eng.active is not None and c.pair == eng.active
-        status = _zh_status(c.disabled or c.status)
+        status = _zh_status(c.disabled or c.status) + (f" ⚠{c.warn}" if c.warn else "")
         st_style = "green" if c.ready else ("red" if c.disabled or "error" in status else "yellow")
         t.add_row(f"{c.pair.maker}→{c.pair.taker}", c.sym.key,
                   f"{_lv(mb.best_bid if mb else None)} / {_lv(mb.best_ask if mb else None)}", _fund(fm),
@@ -234,7 +245,7 @@ def _book_table(eng: Engine, max_rows: int):
 _ZH = (("ready", "就绪"), ("no fresh quotes", "行情不新鲜"), ("warmup", "预热"), ("blocked:", "受限:"),
        ("skipped:", "跳过:"), ("waiting", "等待"), ("close held by profit floor", "平仓被利润地板挡住"),
        ("signal, prices unstable", "信号出现但价格不稳"), ("fresh data", "新鲜行情"), ("price divergence", "价格偏离过大"),
-       ("basis warmup", "基差预热"), ("error:", "错误:"))
+       ("basis warmup", "基差预热"), ("error:", "错误:"), ("paused", "暂停"), ("signal confirming", "信号确认中"))
 
 
 def _zh_status(s: str) -> str:
@@ -347,7 +358,7 @@ def _trades_table(eng: Engine, max_rows: int):
     from rich.table import Table
     t = Table(title=f"执行记录（最近 {max_rows} 条）", expand=True, header_style="bold cyan", title_style="bold")
     for col in ("时间", "交易对", "代币", "类型", "方向", "数量", "maker 均价", "taker 均价", "原始/调整价差%",
-                "毛利U", "改价", "状态"):
+                "滑点%", "毛利U", "改价", "状态"):
         t.add_column(col, overflow="fold")
     rows = [x for x in eng.trades if float(x.get("hedged") or 0) > 0 or x.get("error")][-max_rows:]
     for x in reversed(rows):
@@ -360,7 +371,8 @@ def _trades_table(eng: Engine, max_rows: int):
         pnl = x.get("gross_pnl_usdc")
         t.add_row(ts, str(x.get("pair") or "-"), str(x.get("symbol")), f"[{'magenta' if kind == '开仓' else 'cyan'}]{kind}[/]",
                   dtxt, str(x.get("hedged")), _num(x.get("maker_avg"), 4), _num(x.get("taker_avg"), 4),
-                  f"{_p(_f(x.get('raw_edge')))} / {_p(_f(x.get('adj_edge')))}", "-" if pnl is None else f"{float(pnl):+.3f}",
+                  f"{_p(_f(x.get('raw_edge')))} / {_p(_f(x.get('adj_edge')))}", _p(_f(x.get("slippage"))),
+                  "-" if pnl is None else f"{float(pnl):+.3f}",
                   str(x.get("requotes") or 0), st)
     if not rows:
         t.caption = "暂无成交"
@@ -386,7 +398,7 @@ def build_view(eng: Engine, height: Optional[int] = None):
 
     h = height or 50
     n_books = len(_ordered_ctxs(eng))
-    top_h = 10
+    top_h = 12
     bottom_h = max(10, min(16, h // 4))
     mid_h = max(10, min(18, h // 3))
     book_h = max(8, h - top_h - mid_h - bottom_h)

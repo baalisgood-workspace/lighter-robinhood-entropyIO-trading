@@ -138,11 +138,15 @@ class EntropyVenue(Venue):
     async def _info(self, payload: dict, cost: float = 1.0) -> Any:
         await self.limiter.acquire(cost)
         assert self._session is not None
-        async with self._session.post(self.cfg.rest_url.rstrip("/") + "/info", json=payload, allow_redirects=False) as r:
-            text = await r.text()
-            if r.status != 200:
-                raise VenueError(f"entropy /info {payload.get('type')} -> HTTP {r.status}: {text[:200]}")
-            return json.loads(text)
+        try:
+            async with self._session.post(self.cfg.rest_url.rstrip("/") + "/info", json=payload, allow_redirects=False) as r:
+                text = await r.text()
+                if r.status != 200:
+                    raise VenueError(f"entropy /info {payload.get('type')} -> HTTP {r.status}: {text[:200]}")
+                return json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            self.note_failure(f"info {payload.get('type')}", f"{type(exc).__name__}: {exc}")
+            raise
 
     async def _load_markets(self, symbols: list[str]) -> None:
         meta = await self._info({"type": "meta", "dex": self.dex})
@@ -345,11 +349,13 @@ class EntropyVenue(Venue):
             res = await asyncio.to_thread(self.exchange.order, symbol, is_buy, float(qty), float(price),
                                           {"limit": {"tif": tif}}, reduce_only, cloid)
         except Exception as exc:  # noqa: BLE001 - outcome unknown
+            self.note_failure("order", f"{type(exc).__name__}: {exc}")
             st.apply(status=OrderStatus.UNKNOWN, reason=f"submit exception: {exc}")
             log.error("entropy submit exception (state unknown) %s: %s", st.client_id, exc)
             return st
         self._parse_status(st, res, ioc=(tif == "Ioc"))
         if st.status == OrderStatus.REJECTED:
+            self.note_failure("order", st.reason)
             log.warning("entropy order rejected %s %s: %s", symbol, st.client_id, st.reason)
         return st
 
@@ -359,7 +365,7 @@ class EntropyVenue(Venue):
     async def place_ioc(self, symbol, is_buy, qty, limit_price, reduce_only) -> OrderState:
         st = await self._place(symbol, is_buy, qty, limit_price, reduce_only, "Ioc")
         if st.status == OrderStatus.UNKNOWN:
-            await self.wait_final(st, timeout=8.0, poll=1.5)
+            await self.wait_final(st, timeout=max(8.0, self.cfg.unknown_lookup_s), poll=1.5)
         return st
 
     async def refresh_order(self, st: OrderState) -> OrderState:

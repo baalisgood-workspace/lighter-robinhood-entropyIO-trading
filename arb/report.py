@@ -125,3 +125,47 @@ def print_trades(data_root: Path) -> None:
         win = 100.0 * s["wins"] / s["closes"] if s["closes"] else 0.0
         print(f"{pair:<22}{sym:<16}{s['opens']:>7}{s['closes']:>8}{win:>6.0f}%{s['gross_pnl']:>11.2f}{s['zero_fill']:>8}"
               f"{s['requotes']:>9}{s['alarms']:>8}{s['halts']:>7}")
+
+
+def write_charts(data_root: Path, out_dir: Path, threshold: float, days: Optional[list[str]] = None,
+                 symbols: Optional[list[str]] = None) -> list[Path]:
+    """One PNG per (pair, symbol): basis-adjusted dev of both directions + basis EMA over time
+    (ported idea from lighter-rh history/chart_generator). Needs matplotlib (optional dependency)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from datetime import datetime
+    except ImportError:
+        raise RuntimeError("matplotlib is not installed: pip install matplotlib") from None
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for r in load(data_root, days):
+        if symbols and r["symbol"] not in symbols:
+            continue
+        groups[(r["pair"], r["symbol"])].append(r)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = []
+    for (pair, sym), rows in sorted(groups.items()):
+        rows.sort(key=lambda r: float(r["ts"]))
+        ts = [datetime.fromtimestamp(float(r["ts"])) for r in rows]
+
+        def col(name):
+            return [float(r[name]) if r.get(name) not in (None, "", "-") else float("nan") for r in rows]
+        fig, (a1, a2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+        a1.plot(ts, col("dev_sell_maker"), lw=0.7, label="dev sell maker")
+        a1.plot(ts, col("dev_buy_maker"), lw=0.7, label="dev buy maker")
+        a1.axhline(threshold, color="red", ls="--", lw=0.8, label=f"T1 {threshold:g}%")
+        a1.set_ylabel("%")
+        a1.legend(loc="upper left", fontsize=8)
+        a1.set_title(f"{pair} {sym}  ({len(rows)} samples)")
+        a2.plot(ts, col("basis_now"), lw=0.5, alpha=0.6, label="basis now")
+        a2.plot(ts, col("basis_ema"), lw=1.0, label="basis EMA")
+        a2.set_ylabel("%")
+        a2.legend(loc="upper left", fontsize=8)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        path = out_dir / f"{pair.replace('+', '_')}_{sym}.png"
+        fig.savefig(path, dpi=110)
+        plt.close(fig)
+        files.append(path)
+    return files

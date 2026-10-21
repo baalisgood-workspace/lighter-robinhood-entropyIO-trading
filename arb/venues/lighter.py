@@ -37,6 +37,16 @@ _STATUS = {
 }
 
 
+def _reached_send(exc: BaseException) -> bool:
+    """True if the exception was raised at/after the HTTP send of a signed transaction."""
+    import traceback
+    try:
+        frames = traceback.extract_tb(exc.__traceback__)
+    except Exception:  # noqa: BLE001
+        return True
+    return any(f.name in ("send_tx", "send_tx_with_http_info", "send_tx_batch") for f in frames)
+
+
 def map_status(raw: str) -> OrderStatus:
     raw = (raw or "").lower()
     if raw in _STATUS:
@@ -143,11 +153,15 @@ class LighterVenue(Venue):
     async def _get(self, path: str, params: Optional[dict] = None, cost: float = 1.0) -> Any:
         await self.limiter.acquire(cost)
         assert self._session is not None
-        async with self._session.get(self.cfg.rest_url.rstrip("/") + path, params=params, allow_redirects=False) as r:
-            text = await r.text()
-            if r.status != 200:
-                raise VenueError(f"{self.name} GET {path} -> HTTP {r.status}: {text[:200]}")
-            return json.loads(text)
+        try:
+            async with self._session.get(self.cfg.rest_url.rstrip("/") + path, params=params, allow_redirects=False) as r:
+                text = await r.text()
+                if r.status != 200:
+                    raise VenueError(f"{self.name} GET {path} -> HTTP {r.status}: {text[:200]}")
+                return json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            self.note_failure(f"GET {path}", f"{type(exc).__name__}: {exc}")
+            raise
 
     async def _load_markets(self, symbols: list[str]) -> None:
         data = await self._get("/api/v1/orderBooks")
@@ -386,15 +400,39 @@ class LighterVenue(Venue):
                     is_ask=not st.is_buy, order_type=order_type, time_in_force=tif,
                     reduce_only=st.reduce_only, order_expiry=expiry,
                 )
-        except Exception as exc:  # noqa: BLE001 - network: state unknown, must be resolved by refresh
+        except Exception as exc:  # noqa: BLE001
+            self.note_failure("send", f"{type(exc).__name__}: {exc} {getattr(exc, 'status', '')}")
+            http = getattr(exc, "status", None)
+            if not _reached_send(exc):
+                # failed before the transaction was handed to the HTTP layer (nonce fetch, signing ...):
+                # definitely not sent -> an ordinary rejection (zero-fill retry), never an UNKNOWN halt
+                st.apply(status=OrderStatus.REJECTED, reason=f"not sent: {type(exc).__name__}: {exc}"[:300])
+                log.warning("%s order %s not sent: %s", self.name, st.client_id, exc)
+                await self._resync_nonce()  # a nonce may have been reserved for the unsent transaction
+                return st
+            if isinstance(http, int) and 400 <= http < 500 and http != 429:
+                # the gateway refused the transaction: nothing executed. Resync the nonce for the next one.
+                st.apply(status=OrderStatus.REJECTED, reason=f"send rejected HTTP {http}: {exc}"[:300])
+                log.warning("%s send rejected %s: HTTP %s %s", self.name, st.client_id, http, exc)
+                await self._resync_nonce()
+                return st
             st.apply(status=OrderStatus.UNKNOWN, reason=f"submit exception: {exc}")
             log.error("%s submit exception (state unknown) %s: %s", self.name, st.client_id, exc)
             return st
         code = getattr(resp, "code", None)
         if err is not None or resp is None or (code is not None and int(code) != 200):
             st.apply(status=OrderStatus.REJECTED, reason=str(err or getattr(resp, "message", resp)))
+            self.note_failure("send", st.reason)
             log.warning("%s order rejected %s: %s", self.name, st.client_id, st.reason)
         return st
+
+    async def _resync_nonce(self) -> None:
+        nm = getattr(self.signer, "nonce_manager", None)
+        for k in list(getattr(nm, "api_keys_list", None) or []):
+            try:
+                await nm.async_hard_refresh_nonce(k)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s nonce refresh for key %s failed: %s", self.name, k, exc)
 
     async def place_post_only(self, symbol, is_buy, qty, price, reduce_only) -> OrderState:
         import lighter
@@ -414,6 +452,10 @@ class LighterVenue(Venue):
                            expiry=lighter.SignerClient.DEFAULT_IOC_EXPIRY)
         if st.status == OrderStatus.REJECTED:
             return st
+        if st.status == OrderStatus.UNKNOWN:
+            # ambiguous send: collect evidence (active + inactive order lookups) for longer before the
+            # executor treats it as unknown and halts
+            return await self.wait_final(st, timeout=max(8.0, self.cfg.unknown_lookup_s), poll=1.5)
         return await self.wait_final(st, timeout=8.0, poll=1.5)
 
     async def _find_order(self, st: OrderState) -> Optional[dict]:
@@ -466,6 +508,7 @@ class LighterVenue(Venue):
         async with self._write_lock:
             _tx, resp, err = await self.signer.cancel_order(market_index=self.market(st.symbol).extra["market_id"], order_index=int(st.exchange_id))
         if err is not None:
+            self.note_failure("cancel", str(err))
             log.warning("%s cancel %s returned: %s", self.name, st.client_id, err)
 
     async def cancel_all(self, symbols: list[str]) -> None:

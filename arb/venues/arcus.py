@@ -88,6 +88,9 @@ class ArcusVenue(Venue):
         self._by_oid: dict[str, str] = {}  # exchange order id -> client id
         self._raw_oid: dict[str, Any] = {}  # client id -> order id exactly as returned (signature input)
         self._fills: dict[str, dict] = {}  # client id -> {trade_id: (qty, px)}
+        self._has_state: set[str] = set()  # client ids with at least one real (sized) order row from WS/REST
+        self._cancel_sent: set[str] = set()
+        self._refreshing: set[str] = set()
         self._signer = None
         self._last_nonce = 0
         self._write_lock = asyncio.Lock()
@@ -159,6 +162,7 @@ class ArcusVenue(Venue):
                         raise ArcusUnknown(f"arcus HTTP {r.status} redirect refused")
                     raise VenueError(f"arcus HTTP {r.status} redirect refused")
                 if r.status >= 400:
+                    self.note_failure(f"{method} {path}", f"HTTP {r.status}: {text[:150]}")
                     if method != "GET" and r.status not in (400, 401, 403, 429):
                         raise ArcusUnknown(f"arcus HTTP {r.status}: {text[:200]}")
                     raise ArcusRejected(f"arcus HTTP {r.status}: {text[:200]}")
@@ -166,6 +170,7 @@ class ArcusVenue(Venue):
         except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
             if isinstance(exc, VenueError):
                 raise
+            self.note_failure(f"{method} {path}", f"transport {type(exc).__name__}: {exc}")
             if method != "GET":
                 raise ArcusUnknown(f"arcus transport error: {exc}") from exc
             raise VenueError(f"arcus read failed: {exc}") from exc
@@ -328,19 +333,87 @@ class ArcusVenue(Venue):
             return self.orders.get(self._by_oid[str(oid)])
         return None
 
+    def _foreign(self, st: OrderState, r: dict) -> bool:
+        """A row that matched one of our orders only by clientId but contradicts it (exchange order id or
+        market) belongs to another order reusing the clientId (older / reset session on the same account)."""
+        oid = r.get("orderId")
+        known = self._raw_oid.get(st.client_id) or st.exchange_id
+        if oid is not None and known is not None and str(oid) != str(known):
+            return True
+        mid = r.get("marketId")
+        try:
+            ours = int(self.markets[st.symbol].extra["market_id"]) if st.symbol in self.markets else None
+            if mid not in (None, "", 0, "0") and ours is not None and int(mid) != ours:
+                return True
+        except (TypeError, ValueError, KeyError):
+            pass
+        return False
+
+    def forget(self, st: OrderState) -> None:
+        super().forget(st)
+        if st.status.final:
+            self._has_state.discard(st.client_id)
+            self._cancel_sent.discard(st.client_id)
+
+    def _schedule_refresh(self, st: OrderState) -> None:
+        if st.client_id in self._refreshing or st.status.final:
+            return
+        self._refreshing.add(st.client_id)
+
+        async def run() -> None:
+            try:
+                await asyncio.sleep(0.3)
+                await self.refresh_order(st)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("arcus refresh after rejection push %s: %s", st.client_id, exc)
+            finally:
+                self._refreshing.discard(st.client_id)
+                self._notify(st.client_id)
+        try:
+            asyncio.get_running_loop().create_task(run())
+        except RuntimeError:
+            self._refreshing.discard(st.client_id)
+
     def _apply_order_row(self, r: dict) -> None:
         st = self._state_for(r)
         if st is None:
+            return
+        if self._foreign(st, r):
+            log.warning("arcus: row for %s contradicts the order (orderId %s / market %s): foreign order reusing the clientId, ignored",
+                        st.client_id, r.get("orderId"), r.get("marketId"))
+            self.alarm("client_id_reused_by_foreign_order", st.symbol, f"{st.client_id} orderId={r.get('orderId')}")
+            return
+        raw_status = str(r.get("status") or r.get("state") or "").upper()
+        size = r.get("originalSize")
+        try:
+            zero_size = size is not None and D(str(size)) <= 0
+        except Exception:  # noqa: BLE001
+            zero_size = True
+        if zero_size and raw_status == "REJECTED":
+            # Arcus pushes a zero-value REJECTED row (size 0, market 0, side BUY) when a REQUEST is rejected.
+            # Only an order we have nothing but the placeOrder ACK for (no real row, nothing filled, no cancel
+            # sent) is itself rejected; otherwise it was our cancel that got rejected (often: the order had just
+            # filled) and the row must never be merged - re-read the real state from REST instead.
+            if st.client_id not in self._has_state and st.filled == 0 and st.client_id not in self._cancel_sent:
+                st.apply(status=OrderStatus.REJECTED, reason=str(r.get("rejectReason") or "rejected (zero-value push)"))
+                self._notify(st.client_id)
+            else:
+                log.info("arcus: request rejection push for %s ignored, re-reading order state", st.client_id)
+                self._schedule_refresh(st)
             return
         oid = r.get("orderId")
         if oid is not None:
             self._by_oid[str(oid)] = st.client_id
             self._raw_oid.setdefault(st.client_id, oid)
         filled = None
-        if "originalSize" in r and "remainingSize" in r:
+        if zero_size:
+            pass  # status-only row: a zero size is no quantity evidence (size/fill come from our order)
+        elif "originalSize" in r and "remainingSize" in r:
             filled = D(str(r["originalSize"])) - D(str(r["remainingSize"]))
+            self._has_state.add(st.client_id)
         elif r.get("filledSize") is not None:
             filled = D(str(r["filledSize"]))
+            self._has_state.add(st.client_id)
         avg = r.get("avgFillPrice") or r.get("averageFillPrice")
         avg = D(str(avg)) if avg not in (None, "", "0") else self._fill_avg(st.client_id)
         status = map_arcus_status(r)
@@ -364,6 +437,11 @@ class ArcusVenue(Venue):
         st = self._state_for(r)
         if st is None or not r.get("tradeId"):
             return
+        oid = r.get("orderId")
+        known = self._raw_oid.get(st.client_id) or st.exchange_id
+        if oid is not None and known is not None and str(oid) != str(known):
+            return  # fill of a foreign order reusing our clientId
+        self._has_state.add(st.client_id)
         f = self._fills.setdefault(st.client_id, {})
         f[str(r["tradeId"])] = (D(str(r.get("size", "0"))), D(str(r.get("price", "0"))))
         total = sum(x for x, _ in f.values())
@@ -444,7 +522,8 @@ class ArcusVenue(Venue):
         await self._submit(st, "MARKET", "IOC")
         if st.status == OrderStatus.REJECTED:
             return st
-        return await self.wait_final(st, timeout=8.0, poll=1.0)
+        timeout = max(8.0, self.cfg.unknown_lookup_s) if st.status == OrderStatus.UNKNOWN else 8.0
+        return await self.wait_final(st, timeout=timeout, poll=1.0)
 
     async def refresh_order(self, st: OrderState) -> OrderState:
         row = None
@@ -498,6 +577,7 @@ class ArcusVenue(Venue):
             return
         if oid is None:
             raise VenueError(f"arcus: cannot cancel {st.client_id}, order id unknown")
+        self._cancel_sent.add(st.client_id)
         try:
             await self._cancel_oid(st.symbol, oid)
         except ArcusRejected as exc:

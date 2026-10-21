@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections import deque
 from abc import ABC, abstractmethod
 from decimal import Decimal
 from typing import Optional
@@ -19,6 +20,19 @@ from arb.util import floor_to_step, round_to_step
 
 class VenueError(RuntimeError):
     pass
+
+
+def classify_failure(text: str) -> Optional[str]:
+    """rate_limit | nonce | api_error | None (ordinary order rejection: not a venue health problem)."""
+    t = (text or "").lower()
+    if "429" in t or "too many" in t or "rate limit" in t or "ratelimit" in t or "rate-limit" in t:
+        return "rate_limit"
+    if "nonce" in t or "21104" in t:
+        return "nonce"
+    if (any(f"http {c}" in t for c in range(500, 600)) or "timeout" in t or "timed out" in t
+            or "transport" in t or "connection" in t or "server disconnected" in t or "cannot connect" in t):
+        return "api_error"
+    return None
 
 
 class Venue(ABC):
@@ -42,6 +56,8 @@ class Venue(ABC):
         self.alarms: list[dict] = []  # market-health alarms drained by the engine (journal)
         self.frames = 0  # received WS frames (dashboard throughput)
         self.alarm_count = 0
+        self.failures: deque = deque(maxlen=500)  # (seq, ts, kind, detail) API failures, read by the engine guards
+        self.failure_seq = 0
 
     # ------------------------------------------------------------ liveness / health
     def mark_alive(self) -> None:
@@ -60,6 +76,16 @@ class Venue(ABC):
         self.alarm_count += 1
         if len(self.alarms) < 1000:
             self.alarms.append({"ts": time.time(), "venue": self.name, "kind": kind, "symbol": symbol, "detail": detail[:200]})
+
+    def note_failure(self, where: str, text: str) -> Optional[str]:
+        """Record an API failure if it is a rate limit / nonce / transport problem (not a business rejection)."""
+        kind = classify_failure(text)
+        if kind is None:
+            return None
+        self.failure_seq += 1
+        self.failures.append((self.failure_seq, time.time(), kind, f"{where}: {text}"[:200]))
+        self.alarm(kind, "", f"{where}: {text}")
+        return kind
 
     def reset_books(self, symbols: Optional[list[str]] = None) -> None:
         """Invalidate books (all, or the given symbols) until a fresh snapshot arrives."""
