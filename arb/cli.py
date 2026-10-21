@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from arb.config import VENUE_NAMES, AppConfig, ConfigError, effective_t1, load_config
+from arb.config import VENUE_NAMES, AppConfig, ConfigError, auto_requested, effective_t1, parse_config, pair_key, read_raw, validate
 
 log = logging.getLogger("arb.cli")
 
@@ -39,7 +39,41 @@ def _load(args) -> AppConfig:
         load_dotenv(args.env_file, override=False)
     except ImportError:
         pass
-    return load_config(args.config, _overrides(args))
+    raw = read_raw(args.config, _overrides(args))
+    if getattr(args, "all_symbols", False):
+        raw.setdefault("auto_symbols", {})["enabled"] = True
+    added: list[str] = []
+    if auto_requested(raw) and args.cmd in ("check", "monitor", "live", "positions", "accept-flat"):
+        from arb.autosym import expand, fetch_listing
+        listing, meta, src = fetch_listing(raw)
+        only = None
+        if args.cmd != "monitor" and not (raw.get("market_data") or {}).get("watch_all_venues", False):
+            en = [n for n in VENUE_NAMES if ((raw.get("venues") or {}).get(n) or {}).get("enabled")]
+            only = en if len(en) == 2 else None
+        raw, added = expand(raw, listing, meta, only)
+        print(f"auto_symbols: +{len(added)} symbol(s) from {src} market lists", file=sys.stderr)
+    cfg = parse_config(raw)
+    cfg.source = str(args.config)
+    _apply_cli_modes(cfg, args)
+    return cfg
+
+
+def _apply_cli_modes(cfg: AppConfig, args) -> None:
+    """--maker / --open-mode / --close-mode win over config.yaml (all symbols of this run)."""
+    maker = getattr(args, "maker", None)
+    if maker:
+        en = cfg.enabled_venues()
+        if len(en) != 2 or maker not in en:
+            raise ConfigError(f"--maker {maker}: must be one of the two enabled venues {en} (use --venues a,b)")
+        cfg.roles[pair_key(*en)] = maker
+    for attr in ("open_mode", "close_mode"):
+        val = getattr(args, attr, None)
+        if val:
+            for s in cfg.symbols.values():
+                setattr(s.execution, attr, val)
+    errs = validate(cfg)
+    if errs:
+        raise ConfigError("invalid configuration:\n  - " + "\n  - ".join(errs))
 
 
 def describe(cfg: AppConfig) -> str:
@@ -56,7 +90,11 @@ def describe(cfg: AppConfig) -> str:
             lines.append(f"  {s.key:<10} {p.maker}:{s.venues[p.maker]:<10} {p.taker}:{s.venues[p.taker]:<10} "
                          f"T1={effective_t1(st):.2f}% step={st.grid_step_pct:.2f}% grids={st.max_grids} "
                          f"grid=${st.grid_value_usdc:.0f} order=${st.order_value_usdc:.0f}"
-                         f"{' close_only' if s.close_only or cfg.close_only else ''}")
+                         f"{' close_only' if s.close_only or cfg.close_only else ''}"
+                         f"{(' auto:' + s.category) if s.auto else ''}")
+        ex = syms[0].execution if syms else None
+        if ex:
+            lines.append(f"execution: open {ex.open_mode}, close {ex.close_mode}; auto symbols trade: {cfg.auto_symbols.trade}")
     else:
         lines.append("active pair: none (enable exactly two venues to trade; monitor still works)")
     lines.append(f"watched venues (market data): {cfg.watched_venues()}")
@@ -285,6 +323,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--venues", help="comma list overriding venues.*.enabled, e.g. lighter,entropy")
         p.add_argument("--no-watch-all", action="store_true", help="only stream data for the enabled venues")
         p.add_argument("--watch-all", action="store_true", help="also stream/display the other venues (default for monitor)")
+        p.add_argument("--all-symbols", action="store_true", help="add every symbol listed on >= 2 venues (auto_symbols)")
+        p.add_argument("--maker", choices=VENUE_NAMES, help="maker (quoting) venue of the pair, overrides roles:")
+        p.add_argument("--open-mode", choices=("maker_taker", "taker_taker"), help="override execution.open_mode")
+        p.add_argument("--close-mode", choices=("maker_taker", "taker_taker"), help="override execution.close_mode")
         return p
 
     common(sub.add_parser("check", help="validate config and show pair/symbol mapping (offline)"))
@@ -309,6 +351,12 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--days", help="comma list of YYYY-MM-DD")
     r.add_argument("--chart", action="store_true", help="also write PNG charts to data/charts/ (needs matplotlib)")
     r.add_argument("--symbols", help="comma list for --chart")
+    rk = common(sub.add_parser("rank", help="score symbols from recorded samples (opportunities/day, excess edge, liquidity)"))
+    rk.add_argument("--mode", choices=("maker_taker", "taker_taker"), default=None, help="open mode to score (default: config)")
+    rk.add_argument("--days", help="comma list of YYYY-MM-DD")
+    rk.add_argument("--pair", help="only this pair, e.g. lighter+arcus")
+    rk.add_argument("--top", type=int, default=30)
+    rk.add_argument("--save", action="store_true", help="write data/rank.json (used by auto_symbols.trade: ranked)")
     args = ap.parse_args(argv)
 
     try:
@@ -335,6 +383,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             print(f"\n{len(files)} chart(s) written to {Path(cfg.data_dir) / 'charts'}")
         return rc
+    if args.cmd == "rank":
+        from arb.report import print_rank
+        mode = args.mode or (next(iter(cfg.symbols.values())).execution.open_mode if cfg.symbols else "maker_taker")
+        return print_rank(Path(cfg.data_dir), mode, args.days.split(",") if args.days else None, args.pair, args.top,
+                          args.save, cfg)
     if args.cmd == "markets":
         from arb.markets import fetch_all, render
         listing = asyncio.run(fetch_all(cfg))

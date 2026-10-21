@@ -151,6 +151,65 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5：全标的监控 / 自动加标的 / rank 打分 / 执行模式切换
+
+### 1. 自动加入所有共同标的（`auto_symbols`，默认开启）
+
+启动时读取四个交易所的公开市场列表（失败时用 `data/markets_cache.json` 缓存），把**至少两个交易所都上市**的标的自动加入，不用手动粘贴。`config.yaml` 里手写的标的保持原样不动。
+
+当前实时数量（两边都有的标的）：lighter+arcus 57、lighter+lighter_rh 44、lighter_rh+arcus 37、lighter+entropy 8、lighter_rh/entropy+arcus 各 3。`monitor` 会同时监控全部组合（约 140+ 行）。
+
+自动标的按类别套用参数模板（`auto_symbols.templates`，可改）：
+
+| 类别 | 判定 | 默认参数 |
+|---|---|---|
+| `us_equity` 美股/ETF | 内置美股列表，或 Arcus 标注为 EQUITIES/INDICES/COMMODITIES | 盘内 T1 0.30%，**盘外 0.60%**（夜盘/周末/假日更谨慎） |
+| `crypto` 加密 | 内置加密列表，或 Arcus 标注 CRYPTO | T1 0.20%，步长 0.10% |
+| `other` 其它 | 未上市公司（OPENAI 等）、港韩股、外汇、贵金属、能源、利率、未知 | T1 0.40%，步长 0.20%（最保守） |
+
+分类不对可以用 `auto_symbols.categories: {crypto: [ANSEM]}` 修正；不想要的标的放 `exclude`。美股想盘外完全不开仓：`strategy.offhours_open: false`（平仓照常）。
+
+### 2. 监控全部，只交易筛选过的（`auto_symbols.trade`）
+
+| 取值 | 自动标的能否开仓 |
+|---|---|
+| `none`（默认） | 只监控，不开仓（行情表显示“就绪·仅监控”） |
+| `filtered` | 实时流动性过滤通过才开仓：两边盘口点差 ≤ `max_book_spread_pct`（0.15%）且最薄一侧深度 ≥ `min_depth_usdc`（300U），按约 60 秒 EMA 计算 |
+| `ranked` | 只交易 `arb rank --save` 排名前 `ranked_top_n`（15）个，同时还要通过流动性过滤 |
+
+- 手写的标的和 `include` 白名单里的标的照常交易（`filter_configured: true` 时也要过流动性过滤）。
+- 只监控的标的不参与对账、不占用多开锁（不影响其他进程交易它）。
+- 自动标的如果启动时交易所里已有**不是本程序开的仓位**（手动仓位或其他程序），会自动跳过该标的，不会因为对账不一致而拒绝启动。
+
+### 3. `arb rank`：给标的打分
+
+```bash
+./start.sh monitor                       # 先全部监控 1–2 天（基差 EMA 需预热 1 小时后才有有效样本）
+./start.sh rank                          # 按开仓机会打分
+./start.sh rank --mode taker_taker       # 按 taker→taker 开仓模式打分（手续费按两边吃单）
+./start.sh rank --pair lighter+arcus --top 20 --save   # 保存到 data/rank.json，供 trade: ranked 使用
+```
+
+每个标的输出：数据时长、每天机会次数、平均峰值超额（超过“T1 + 手续费 + 资金费”的部分）、平均持续秒数、机会时间占比、盘内占比（美股）、盘口点差中位数、深度中位数、分数。分数 ≈ 每天机会次数 × (T1 + 平均峰值超额) × 流动性系数，只用于排序，不是收益预测；数据不足 1 小时记 0。采样文件新增了 T1、两种模式手续费、资金费、taker→taker 价差、点差、深度、盘内标记等列（旧文件保留，新列写入 `YYYY-MM-DD_v5.csv`）。
+
+### 4. 执行模式与 maker 方可用命令行切换
+
+```bash
+./start.sh live --venues lighter,arcus --maker lighter           # 临时改成在 Lighter 挂单、Arcus 吃单
+./start.sh live --venues lighter,arcus --open-mode taker_taker   # 开仓两边都用 IOC 吃单
+./start.sh live --venues lighter,arcus --close-mode taker_taker  # 平仓两边都吃单
+./start.sh monitor --all-symbols                                 # 本次运行临时开启自动标的
+```
+
+- **taker→taker 开仓**（`execution.open_mode: taker_taker`）：信号按两边立即成交价（VWAP）计算，手续费按两边吃单费；满足条件时先在 maker 端 IOC，成交多少立刻在另一边对冲多少，不挂单等待。适合价差大、持续时间短的机会；手续费更高，T1 需要覆盖。
+- 命令行参数优先于 `config.yaml`，对本次运行的所有标的生效；仪表盘“执行模式”一行显示当前模式。
+
+### 5. 仪表盘
+
+- 标题“套利执行终端 v5”；系统区显示执行模式、自动标的数量、可开仓数量。
+- 行情表默认按“有持仓优先，其次离开仓门槛最近”排序（`ui.sort: gap`），每个标的一行；放不下的折叠成一行汇总（隐藏数量、就绪数、距开仓 ≤0.05% 的数量、最近差距）。`ui.max_book_rows` 可限制行数。
+- 自动标的显示“·自动”；监控模式下“下次开”也会显示预估开仓门槛。
+
 ## v4：从 lighter-rh / arcus-maker-lighter-taker v8–v17 移植
 
 以下功能来自 `baalisgood/lighter-rh`（arbitrage_monitor_v2 的全局风控 / 分段网格配置）和 `baalisgood/arcus-maker-lighter-taker`（v8–v17，main @18b02e4），改写为四交易所通用实现，原有功能与仪表盘全部保留。新代码集中在 `arb/engine/guards.py`，便于继续扩展。
@@ -234,6 +293,7 @@ arb/
   engine/engine.py  主循环、决策、对账、采样
   engine/guards.py  v4 全局暂停 / 禁开 / 提醒（滑点、延迟、限流退避、波动…）
   markets.py        四所共同标的列表（arb markets）
+  autosym.py        v5 自动加标的与分类模板
   ui.py / report.py 终端面板 / 价差统计
 tests/              单元测试（pytest）
 ```

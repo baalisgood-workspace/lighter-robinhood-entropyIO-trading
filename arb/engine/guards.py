@@ -18,6 +18,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
+from arb.config import us_regular_hours
 from arb.engine import signals as sg
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -168,7 +169,15 @@ class Guards:
 
     # ------------------------------------------------------------ open-only blocks
     def open_block(self, c: "Ctx", now: float) -> str:
-        rk = c.sym.risk
+        rk, st = c.sym.risk, c.sym.strategy
+        if c.policy == "monitor":
+            return f"仅监控 ({c.policy_why})"
+        if c.policy == "filter":
+            ok, why = self.eng.liquidity_ok(c, now)
+            if not ok:
+                return f"流动性过滤: {why}"
+        if st.session == "us_equity" and not st.offhours_open and not us_regular_hours(now):
+            return "美股盘外不开仓"
         if now < c.vol_block_until:
             return f"波动 {c.vol_amp:.1f}% 禁开 {c.vol_block_until - now:.0f}s"
         if now < c.ro_block_until:
@@ -179,7 +188,7 @@ class Guards:
                 return f"今日开仓 {c.opens_today}/{rk.max_daily_opens}"
         if rk.max_leg_spread_pct is not None:
             legs = [(c.pair.taker, c.taker_sym)]
-            if c.sym.execution.close_mode == "taker_taker":
+            if "taker_taker" in (c.sym.execution.close_mode, c.sym.execution.open_mode):
                 legs.append((c.pair.maker, c.maker_sym))
             for vname, sym in legs:
                 b = self.eng.venues[vname].book(sym)

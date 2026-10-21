@@ -86,6 +86,8 @@ class StrategyConfig:
     # signal persistence (lighter-rh spread_persistence_seconds): join/improve modes open only after the
     # edge stayed above the trigger continuously for this many seconds. 0 = immediately (previous behaviour)
     signal_confirm_s: float = 0.0
+    # us_equity session: false = no new opens outside NY regular hours at all (closes keep working)
+    offhours_open: bool = True
 
 
 @dataclass
@@ -122,6 +124,9 @@ class ExecutionConfig:
     hedge_max_orders: int = 12  # hard cap of hedge IOCs per hedge call (partials included)
     hedge_min_notional_usdc: float = 10.0  # accumulate partial maker fills until the hedge reaches this
     close_mode: str = "maker_taker"  # maker_taker | taker_taker
+    # open_mode taker_taker: open with an IOC on the maker venue too (no resting order); the edge is priced
+    # with immediate fills on both books and both taker fees
+    open_mode: str = "maker_taker"  # maker_taker | taker_taker
     order_poll_interval_s: float = 1.0  # REST fallback poll period when no push update arrives
     order_final_timeout_s: float = 8.0  # wait for final state after cancel / IOC
     cooldown_s: float = 1.0
@@ -195,11 +200,40 @@ class GuardsConfig:
 
 
 @dataclass
+class AutoSymbolsConfig:
+    """v5: add every symbol listed on >= min_venues venues automatically (arb/autosym.py)."""
+    enabled: bool = False  # also: `symbols: auto` or CLI --all-symbols
+    min_venues: int = 2
+    include: list = field(default_factory=list)  # whitelist: auto symbols that may trade like configured ones
+    exclude: list = field(default_factory=list)  # never add these
+    max_symbols: Optional[int] = None  # cap on auto-added symbols (alphabetical after the include list)
+    # which AUTO symbols may open positions (configured + include always may):
+    #   none = monitor only | filtered = when the live liquidity filter passes | ranked = top N of `arb rank --save`
+    trade: str = "none"
+    ranked_top_n: int = 15
+    rank_max_age_h: float = 72.0  # older rank file -> warning (still used)
+    # live liquidity filter (EMA ~60 s of both books)
+    max_book_spread_pct: Optional[float] = 0.15  # widest of the two books' bid/ask spread
+    min_depth_usdc: Optional[float] = 300.0  # thinnest side within risk.depth_levels on either book
+    filter_configured: bool = False  # also apply the filter to configured symbols
+    categories: dict = field(default_factory=dict)  # extra classification {us_equity: [..], crypto: [..], other: [..]}
+    templates: dict = field(default_factory=dict)  # per category {strategy: {...}, risk: {...}, ...}
+
+
+@dataclass
+class UiConfig:
+    sort: str = "gap"  # gap = closest to the open trigger first (positions first) | config = config order
+    max_book_rows: Optional[int] = None  # null = as many as the terminal fits
+
+
+@dataclass
 class SymbolConfig:
     key: str
     venues: dict[str, str]
     enabled: bool = True
     close_only: bool = False
+    auto: bool = False  # added by auto_symbols
+    category: str = ""  # us_equity | crypto | other (auto symbols)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     basis: BasisConfig = field(default_factory=BasisConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
@@ -245,6 +279,8 @@ class AppConfig:
     max_parallel_slices: int = 1  # concurrent maker slices (different symbols) per instance
     ui_refresh_s: float = 1.0
     guards: GuardsConfig = field(default_factory=GuardsConfig)
+    auto_symbols: AutoSymbolsConfig = field(default_factory=AutoSymbolsConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
     source: str = ""
 
     def enabled_venues(self) -> list[str]:
@@ -295,23 +331,24 @@ DEFAULT_ROLES = {
 }
 
 
-def load_config(path: str | Path, overrides: Optional[dict] = None) -> AppConfig:
-    path = Path(path)
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+def read_raw(path: str | Path, overrides: Optional[dict] = None) -> dict:
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if overrides:
         raw = _deep_merge(raw, overrides)
-    cfg = parse_config(raw)
+    return raw
+
+
+def load_config(path: str | Path, overrides: Optional[dict] = None) -> AppConfig:
+    cfg = parse_config(read_raw(path, overrides))
     cfg.source = str(path)
     return cfg
 
 
-def parse_config(raw: dict) -> AppConfig:
-    raw = copy.deepcopy(raw)
-    allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s", "ui_refresh_s", "guards"}
-    unknown = {k for k in set(raw) - allowed_top if not str(k).startswith("x-")}  # x-*: YAML anchors
-    if unknown:
-        raise ConfigError(f"unknown top-level keys: {sorted(unknown)}")
+def auto_requested(raw: dict) -> bool:
+    return raw.get("symbols") == "auto" or bool((raw.get("auto_symbols") or {}).get("enabled"))
 
+
+def parse_venues(raw: dict) -> dict[str, VenueConfig]:
     venues: dict[str, VenueConfig] = {}
     raw_venues = raw.get("venues") or {}
     if set(raw_venues) - set(VENUE_NAMES):
@@ -320,6 +357,20 @@ def parse_config(raw: dict) -> AppConfig:
         merged = {**DEFAULT_VENUES[name], **(raw_venues.get(name) or {})}
         merged["name"] = name
         venues[name] = _build(VenueConfig, merged, f"venues.{name}")
+    return venues
+
+
+def parse_config(raw: dict) -> AppConfig:
+    raw = copy.deepcopy(raw)
+    allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s",
+                   "ui_refresh_s", "guards", "auto_symbols", "ui"}
+    if raw.get("symbols") == "auto":  # only auto symbols (expanded by arb/autosym.py before parsing)
+        raw["symbols"] = {}
+    unknown = {k for k in set(raw) - allowed_top if not str(k).startswith("x-")}  # x-*: YAML anchors
+    if unknown:
+        raise ConfigError(f"unknown top-level keys: {sorted(unknown)}")
+
+    venues = parse_venues(raw)
 
     roles = dict(DEFAULT_ROLES)
     for k, v in (raw.get("roles") or {}).items():
@@ -334,7 +385,7 @@ def parse_config(raw: dict) -> AppConfig:
     symbols: dict[str, SymbolConfig] = {}
     for key, sraw in (raw.get("symbols") or {}).items():
         sraw = sraw or {}
-        extra = set(sraw) - {"venues", "enabled", "close_only", "strategy", "basis", "execution", "risk"}
+        extra = set(sraw) - {"venues", "enabled", "close_only", "strategy", "basis", "execution", "risk", "auto", "category"}
         if extra:
             raise ConfigError(f"symbols.{key}: unknown keys {sorted(extra)}")
         vmap = {str(k): str(v) for k, v in (sraw.get("venues") or {}).items()}
@@ -347,13 +398,15 @@ def parse_config(raw: dict) -> AppConfig:
             venues=vmap,
             enabled=bool(sraw.get("enabled", True)),
             close_only=bool(sraw.get("close_only", False)),
+            auto=bool(sraw.get("auto", False)),
+            category=str(sraw.get("category") or ""),
             strategy=_build(StrategyConfig, _deep_merge(defaults.get("strategy") or {}, sraw.get("strategy") or {}), f"symbols.{key}.strategy"),
             basis=_build(BasisConfig, _deep_merge(defaults.get("basis") or {}, sraw.get("basis") or {}), f"symbols.{key}.basis"),
             execution=_build(ExecutionConfig, _deep_merge(defaults.get("execution") or {}, sraw.get("execution") or {}), f"symbols.{key}.execution"),
             risk=_build(RiskConfig, _deep_merge(defaults.get("risk") or {}, sraw.get("risk") or {}), f"symbols.{key}.risk"),
         )
     if not symbols:
-        raise ConfigError("no symbols configured")
+        raise ConfigError("no symbols configured (auto_symbols: market list unavailable?)")
 
     md = raw.get("market_data") or {}
     tr = raw.get("trading") or {}
@@ -376,6 +429,8 @@ def parse_config(raw: dict) -> AppConfig:
         sampler_interval_s=float(raw.get("sampler_interval_s", 5.0)),
         ui_refresh_s=float(raw.get("ui_refresh_s", 1.0)),
         guards=_build(GuardsConfig, raw.get("guards") or {}, "guards"),
+        auto_symbols=_build(AutoSymbolsConfig, raw.get("auto_symbols") or {}, "auto_symbols"),
+        ui=_build(UiConfig, raw.get("ui") or {}, "ui"),
     )
     errors = validate(cfg)
     if errors:
@@ -405,6 +460,15 @@ def validate(cfg: AppConfig) -> list[str]:
         errs.append("guards: need 0 < backoff_base_s <= backoff_max_s")
     if g.api_failure_count < 1 or g.slippage_burst_count < 0:
         errs.append("guards: api_failure_count >= 1, slippage_burst_count >= 0")
+    a = cfg.auto_symbols
+    if a.trade not in ("none", "filtered", "ranked"):
+        errs.append("auto_symbols.trade must be none|filtered|ranked")
+    if a.min_venues < 2 or a.ranked_top_n < 1 or (a.max_symbols is not None and a.max_symbols < 0):
+        errs.append("auto_symbols: min_venues >= 2, ranked_top_n >= 1, max_symbols >= 0")
+    if set(a.categories) - {"us_equity", "crypto", "other"} or set(a.templates) - {"us_equity", "crypto", "other"}:
+        errs.append("auto_symbols.categories/templates: keys must be us_equity|crypto|other")
+    if cfg.ui.sort not in ("gap", "config"):
+        errs.append("ui.sort must be gap|config")
     if not (1 <= cfg.max_parallel_slices <= 32):
         errs.append("trading.max_parallel_slices must be 1..32")
     for v in cfg.venues.values():
@@ -456,6 +520,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.risk: warmup_fresh_s>=0, quick_resume_s>=0, max_leverage>0, 0<=reserve_ratio<1")
         if ex.close_mode not in ("maker_taker", "taker_taker"):
             errs.append(f"{p}.execution.close_mode must be maker_taker|taker_taker")
+        if ex.open_mode not in ("maker_taker", "taker_taker"):
+            errs.append(f"{p}.execution.open_mode must be maker_taker|taker_taker")
         if ex.maker_timeout_s <= 0 or ex.hedge_max_attempts < 1 or ex.hedge_slippage_pct <= 0:
             errs.append(f"{p}.execution: maker_timeout_s>0, hedge_max_attempts>=1, hedge_slippage_pct>0")
         if ex.hedge_slippage_pct + ex.hedge_slippage_step_pct * (ex.hedge_max_attempts - 1) > 2.0:

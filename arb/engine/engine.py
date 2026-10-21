@@ -27,6 +27,14 @@ log = logging.getLogger("arb.engine")
 ZERO = Decimal("0")
 
 
+SAMPLE_COLS = ["ts", "pair", "maker", "taker", "symbol", "mid_maker", "mid_taker", "basis_now", "basis_ema", "basis_ready",
+               "raw_sell_maker", "dev_sell_maker", "raw_buy_maker", "dev_buy_maker", "qty",
+               # v5 (arb rank): open mode of the dev columns, T1, round-trip fees, adverse funding per direction,
+               # taker-taker edges, liquidity EMAs, NY regular hours flag, category
+               "open_mode", "t1", "fee_mt", "fee_tt", "fund_sell", "fund_buy", "tt_dev_sell", "tt_dev_buy",
+               "book_spread_pct", "depth_usdc", "rth", "category"]
+
+
 @dataclass
 class Ctx:
     pair: Pair
@@ -65,6 +73,16 @@ class Ctx:
     opens_today: int = 0
     adverse_since: Optional[float] = None
     warn: str = ""
+    # v5: trade policy (trade | filter | monitor) and live liquidity filter
+    policy: str = "trade"
+    policy_why: str = ""
+    liq_spread: Optional[float] = None  # EMA of the widest book spread (%) of the two legs
+    liq_depth: Optional[float] = None  # EMA of the thinnest side depth (USDC) of the two legs
+    liq_since: Optional[float] = None
+    liq_last: float = 0.0
+    need_sell: Optional[float] = None  # open trigger incl. fees + funding (flat: level 1), per direction
+    need_buy: Optional[float] = None
+    gap: Optional[float] = None  # min(need - dev) over directions: <= 0 means an open signal
 
     @property
     def key(self) -> str:
@@ -185,9 +203,73 @@ class Engine:
                 self.ctxs.append(Ctx(pair=pair, sym=s, maker_sym=ms, taker_sym=ts, basis=basis))
         if self.active and not any(c.pair == self.active for c in self.ctxs):
             raise ConfigError(f"no tradable symbol for active pair {self.active.key}")
+        self._assign_policies()
+
+    def _assign_policies(self) -> None:
+        """Which symbols may OPEN: configured (and auto_symbols.include) always; auto ones per auto_symbols.trade."""
+        a = self.cfg.auto_symbols
+        include = {str(x).upper() for x in a.include}
+        ranked: Optional[set] = None
+        if a.trade == "ranked" and any(c.sym.auto for c in self.ctxs):
+            ranked = set()
+            path = Path(self.cfg.data_dir) / "rank.json"
+            try:
+                data = json.loads(path.read_text())
+                age_h = (time.time() - float(data.get("ts", 0))) / 3600
+                if age_h > a.rank_max_age_h:
+                    self.event(f"WARNING {path} is {age_h:.0f}h old - run `arb rank --save` again", logging.WARNING)
+                for pair in {c.pair for c in self.ctxs}:
+                    rows = [r for r in data.get("rows", []) if r.get("pair") == pair.key and r.get("maker") == pair.maker
+                            and float(r.get("score") or 0) > 0]
+                    rows.sort(key=lambda r: -float(r["score"]))
+                    ranked |= {(pair.key, r["symbol"]) for r in rows[:a.ranked_top_n]}
+            except (OSError, ValueError) as exc:
+                self.event(f"WARNING auto_symbols.trade=ranked but {path} unusable ({exc}); auto symbols monitor only",
+                           logging.WARNING)
+        for c in self.ctxs:
+            if not c.sym.auto or c.sym.key.upper() in include:
+                c.policy, c.policy_why = ("filter" if a.filter_configured else "trade"), ""
+            elif a.trade == "filtered":
+                c.policy, c.policy_why = "filter", ""
+            elif a.trade == "ranked" and ranked is not None and (c.pair.key, c.sym.key) in ranked:
+                c.policy, c.policy_why = "filter", "ranked"
+            else:
+                c.policy = "monitor"
+                c.policy_why = "auto symbol, not in rank top N" if a.trade == "ranked" else "auto symbol (trade: none)"
+
+    def liquidity_ok(self, c: Ctx, now: float) -> tuple[bool, str]:
+        a = self.cfg.auto_symbols
+        if c.liq_since is None or now - c.liq_since < 30:
+            return False, "liquidity filter warming up"
+        if a.max_book_spread_pct is not None and (c.liq_spread is None or c.liq_spread > a.max_book_spread_pct):
+            return False, f"book spread {c.liq_spread or 0:.3f}% > {a.max_book_spread_pct:g}%"
+        if a.min_depth_usdc is not None and (c.liq_depth is None or c.liq_depth < a.min_depth_usdc):
+            return False, f"depth {c.liq_depth or 0:.0f} < {a.min_depth_usdc:.0f} USDC"
+        return True, ""
+
+    def _observe_liquidity(self, c: Ctx, now: float, mb, tb) -> None:
+        levels = c.sym.risk.depth_levels
+        spreads, depths = [], []
+        for b in (mb, tb):
+            if b.best_bid is None or b.best_ask is None or not b.mid:
+                return
+            spreads.append(float((b.best_ask.price - b.best_bid.price) / b.mid * 100))
+            for side in (b.bids, b.asks):
+                depths.append(float(sum(lv.price * lv.size for lv in side[:levels])))
+        sp, dp = max(spreads), min(depths)
+        dt = now - c.liq_last if c.liq_last else 0.0
+        c.liq_last = now
+        if c.liq_since is None or c.liq_spread is None or dt > 60:
+            c.liq_since, c.liq_spread, c.liq_depth = now, sp, dp
+            return
+        k = min(1.0, dt / 60.0)
+        c.liq_spread += (sp - c.liq_spread) * k
+        c.liq_depth += (dp - c.liq_depth) * k
 
     def active_ctxs(self) -> list[Ctx]:
-        return [c for c in self.ctxs if self.active and c.pair == self.active and not c.claim_block]
+        # monitor-only auto symbols are not traded, reconciled or counted while flat (they only show prices)
+        return [c for c in self.ctxs if self.active and c.pair == self.active and not c.claim_block
+                and not (c.policy == "monitor" and not self.position(c).grids)]
 
     def position(self, ctx: Ctx) -> SymbolPosition:
         return self.positions.get(ctx.pair.key, ctx.sym.key)
@@ -208,6 +290,8 @@ class Engine:
         names = (self.active.maker, self.active.taker)
         self.claims.write_accounts({n: self.venues[n].account_id for n in names})
         for c in [c for c in self.ctxs if c.pair == self.active]:
+            if c.policy == "monitor" and not self.position(c).grids:
+                continue  # monitor-only auto symbol: never opens, leave it to other instances
             for n in names:
                 why = self.claims.acquire(n, self.venues[n].account_id, c.sym.key)
                 if why:
@@ -238,6 +322,12 @@ class Engine:
             at = pt.get(c.taker_sym).qty if c.taker_sym in pt else ZERO
             tol = Decimal(str(c.sym.risk.reconcile_tolerance_mult)) * max(M.market(c.maker_sym).min_qty, T.market(c.taker_sym).min_qty)
             dm, dt = am - sp.expected_maker_qty(), at - sp.expected_taker_qty()
+            if initial and c.sym.auto and sp.is_flat() and (am or at):
+                # auto-added symbol with a position this bot never opened (manual / other program): leave it alone
+                c.claim_block = f"exchange position not opened by this bot ({M.name} {am}, {T.name} {at})"
+                c.status = f"skipped: {c.claim_block}"
+                self.event(f"WARNING {c.sym.key}: {c.claim_block} - symbol skipped", logging.WARNING)
+                continue
             if am or at or not sp.is_flat():
                 rows.append(dict(symbol=c.sym.key, maker=am, maker_exp=sp.expected_maker_qty(), taker=at,
                                  taker_exp=sp.expected_taker_qty(), ok=abs(dm) <= tol and abs(dt) <= tol))
@@ -392,28 +482,51 @@ class Engine:
 
     async def _sampler_loop(self) -> None:
         self.sample_dir.mkdir(parents=True, exist_ok=True)
-        cols = ["ts", "pair", "maker", "taker", "symbol", "mid_maker", "mid_taker", "basis_now", "basis_ema", "basis_ready",
-                "raw_sell_maker", "dev_sell_maker", "raw_buy_maker", "dev_buy_maker", "qty"]
         while not self.stopping:
             await asyncio.sleep(self.cfg.sampler_interval_s)
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             path = self.sample_dir / f"{day}.csv"
+            if path.exists():
+                with path.open() as fh:
+                    if fh.readline().strip().split(",") != SAMPLE_COLS:  # older layout: keep it, write a v5 file
+                        path = self.sample_dir / f"{day}_v5.csv"
             new = not path.exists()
-            rows = []
-            for c in self.ctxs:
-                mb, tb = self.venues[c.pair.maker].book(c.maker_sym), self.venues[c.pair.taker].book(c.taker_sym)
-                if not (mb and tb and mb.mid and tb.mid):
-                    continue
-                rows.append([f"{time.time():.3f}", c.pair.key, c.pair.maker, c.pair.taker, c.sym.key, str(mb.mid), str(tb.mid),
-                             f"{sg.basis_value(mb.mid, tb.mid):.5f}", f"{c.basis_value:.5f}", int(c.ready),
-                             _f(c.q_sell.raw if c.q_sell else None), _f(c.q_sell.dev if c.q_sell else None),
-                             _f(c.q_buy.raw if c.q_buy else None), _f(c.q_buy.dev if c.q_buy else None), str(c.qty)])
+            rows = [r for r in (self.sample_row(c) for c in self.ctxs) if r]
             if rows:
                 with path.open("a", newline="") as f:
                     w = csv.writer(f)
                     if new:
-                        w.writerow(cols)
+                        w.writerow(SAMPLE_COLS)
                     w.writerows(rows)
+
+    def sample_row(self, c: Ctx) -> Optional[list]:
+        M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
+        mb, tb = M.book(c.maker_sym), T.book(c.taker_sym)
+        if not (mb and tb and mb.mid and tb.mid):
+            return None
+        rk, st, ex = c.sym.risk, c.sym.strategy, c.sym.execution
+        ot = ex.open_mode == "taker_taker"
+        tick = M.price_tick_at(c.maker_sym, mb.mid)
+
+        def other(d: str, cur):  # the edge of the other open mode (both are recorded for `arb rank --mode`)
+            if c.qty <= 0:
+                return None
+            return sg.build_quote(d, mb, tb, c.qty, c.basis_value, ex.maker_price_mode, tick, rk.depth_levels,
+                                  rk.depth_band_pct, maker_as_taker=not ot)
+        qs, qb = c.q_sell, c.q_buy
+        os_, ob_ = other(sg.SELL_MAKER, qs), other(sg.BUY_MAKER, qb)
+        mt_s, mt_b, tt_s, tt_b = (os_, ob_, qs, qb) if ot else (qs, qb, os_, ob_)
+        tt_dev = [_f(tt_s.dev if tt_s else None), _f(tt_b.dev if tt_b else None)]
+        from arb.config import us_regular_hours
+        return [f"{time.time():.3f}", c.pair.key, c.pair.maker, c.pair.taker, c.sym.key, str(mb.mid), str(tb.mid),
+                f"{sg.basis_value(mb.mid, tb.mid):.5f}", f"{c.basis_value:.5f}", int(c.ready),
+                _f(mt_s.raw if mt_s else None), _f(mt_s.dev if mt_s else None),
+                _f(mt_b.raw if mt_b else None), _f(mt_b.dev if mt_b else None), str(c.qty),
+                ex.open_mode, f"{effective_t1(st):.4f}",
+                f"{self._fees(c, 'maker_taker'):.5f}", f"{self._fees(c, 'taker_taker'):.5f}",
+                _f(self._funding(c, sg.SELL_MAKER)), _f(self._funding(c, sg.BUY_MAKER)), *tt_dev,
+                _f(c.liq_spread), "" if c.liq_depth is None else f"{c.liq_depth:.0f}", int(us_regular_hours()),
+                c.sym.category or ("configured" if not c.sym.auto else "")]
 
     # ------------------------------------------------------------ compute
     def compute(self, c: Ctx, now: float) -> None:
@@ -467,8 +580,13 @@ class Engine:
         c.qty = floor_to_step(Decimal(str(st.order_value_usdc)) / ref, step)
         ex = c.sym.execution
         tick = M.price_tick_at(c.maker_sym, mb.mid)
-        c.q_sell = sg.build_quote(sg.SELL_MAKER, mb, tb, c.qty, c.basis_value, ex.maker_price_mode, tick, rk.depth_levels, rk.depth_band_pct)
-        c.q_buy = sg.build_quote(sg.BUY_MAKER, mb, tb, c.qty, c.basis_value, ex.maker_price_mode, tick, rk.depth_levels, rk.depth_band_pct)
+        ot = ex.open_mode == "taker_taker"  # open quotes priced as immediate fills on both books
+        c.q_sell = sg.build_quote(sg.SELL_MAKER, mb, tb, c.qty, c.basis_value, ex.maker_price_mode, tick, rk.depth_levels,
+                                  rk.depth_band_pct, maker_as_taker=ot)
+        c.q_buy = sg.build_quote(sg.BUY_MAKER, mb, tb, c.qty, c.basis_value, ex.maker_price_mode, tick, rk.depth_levels,
+                                 rk.depth_band_pct, maker_as_taker=ot)
+        self._observe_liquidity(c, now, mb, tb)
+        self._preview_need(c, now)
         warm = now - c.fresh_since
         if c.ready and warm < rk.warmup_fresh_s:
             c.ready, reason = False, f"warmup {warm:.0f}/{rk.warmup_fresh_s:.0f}s fresh data"
@@ -477,10 +595,27 @@ class Engine:
             c.status = f"skipped: {c.claim_block}"
 
     # ------------------------------------------------------------ decide
-    def _fees(self, c: Ctx) -> float:
+    def _fees(self, c: Ctx, open_mode: Optional[str] = None, close_mode: Optional[str] = None) -> float:
         M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
-        tt = c.sym.execution.close_mode == "taker_taker"
-        return sg.roundtrip_fee_pct(M.maker_fee_pct(c.maker_sym), T.taker_fee_pct(c.taker_sym), tt, M.taker_fee_pct(c.maker_sym))
+        ex = c.sym.execution
+        tt = (close_mode or ex.close_mode) == "taker_taker"
+        ot = (open_mode or ex.open_mode) == "taker_taker"
+        return sg.roundtrip_fee_pct(M.maker_fee_pct(c.maker_sym), T.taker_fee_pct(c.taker_sym), tt, M.taker_fee_pct(c.maker_sym),
+                                    open_taker_taker=ot)
+
+    def _preview_need(self, c: Ctx, now: float) -> None:
+        """Open trigger of the next grid per direction (monitor + dashboard sorting + samples)."""
+        st = c.sym.strategy
+        sp = self.position(c)
+        level = min(len(sp.grids) + 1, st.max_grids)
+        base = sg.open_level(effective_t1(st, now), st.grid_step_pct, level) + self._fees(c)
+        c.need_sell = base + self._funding(c, sg.SELL_MAKER)
+        c.need_buy = base + self._funding(c, sg.BUY_MAKER)
+        gaps = []
+        for q, need in ((c.q_sell, c.need_sell), (c.q_buy, c.need_buy)):
+            if q is not None and q.ok and (not sp.direction or sp.direction == sg.POSITION_OF[q.direction]):
+                gaps.append(need - q.dev)
+        c.gap = min(gaps) if gaps else None
 
     def _funding_hourly(self, c: Ctx, direction: str) -> Optional[float]:
         """Adverse funding of holding `direction`, percent per hour (None if a rate is unknown)."""
@@ -567,6 +702,7 @@ class Engine:
                 cands.append((gap, plan))
 
         # ---------------- open
+        topen: list[tuple[float, ExecPlan]] = []
         if not (self.cfg.close_only or c.sym.close_only):
             fees = self._fees(c)
             for q in (c.q_sell, c.q_buy):
@@ -594,10 +730,29 @@ class Engine:
                 qty = self._rq(c, min(c.qty, remaining))
                 if qty < min_qty:
                     continue
+                ot = ex.open_mode == "taker_taker"
                 plan = ExecPlan("open", c.pair, c.sym, c.maker_sym, c.taker_sym, q.direction, qty, level, need, basis_fn,
-                                target=target)
+                                target=target, taker_taker=ot)
                 plan.carry_in = self._carry(c, sp, q.direction)
+                if ot:
+                    if need - q.dev <= 0:
+                        topen.append((need - q.dev, plan))  # immediate IOC on both venues, never resting
+                    continue
                 cands.append((need - q.dev, plan))
+            if topen:
+                gap, plan = min(topen, key=lambda x: x[0])
+                if not self._confirmed(c, st, now):
+                    return None
+                if not self._stable(c):
+                    c.status = "open signal, prices unstable"
+                    return None
+                why = self._open_blocked(c, plan, now)
+                if why:
+                    c.status = f"blocked: {why}"
+                    return None
+                return plan
+            if ex.open_mode == "taker_taker":
+                c.signal_since = None  # no immediate signal this tick: persistence restarts
         if not cands:
             return None
         if thr:
@@ -610,13 +765,8 @@ class Engine:
                 c.signal_since = None
                 return None
             gap, plan = min(opens, key=lambda x: x[0])
-            if st.signal_confirm_s > 0:  # spread persistence: the signal must hold continuously
-                if c.signal_since is None:
-                    c.signal_since = now
-                held = now - c.signal_since
-                if held < st.signal_confirm_s:
-                    c.status = f"signal confirming {held:.1f}/{st.signal_confirm_s:g}s"
-                    return None
+            if not self._confirmed(c, st, now):
+                return None
         if not self._stable(c):
             c.status = f"{plan.kind} signal, prices unstable"
             return None
@@ -626,6 +776,18 @@ class Engine:
                 c.status = f"blocked: {why}"
                 return None
         return plan
+
+    def _confirmed(self, c: Ctx, st, now: float) -> bool:
+        """Spread persistence: the open signal must hold continuously for signal_confirm_s."""
+        if st.signal_confirm_s <= 0:
+            return True
+        if c.signal_since is None:
+            c.signal_since = now
+        held = now - c.signal_since
+        if held < st.signal_confirm_s:
+            c.status = f"signal confirming {held:.1f}/{st.signal_confirm_s:g}s"
+            return False
+        return True
 
     def _carry(self, c: Ctx, sp: SymbolPosition, direction: str) -> Decimal:
         """Unhedged maker dust with the same sign as this slice's maker fills is hedged together with it."""

@@ -99,9 +99,12 @@ def adjusted_edge(direction: str, raw: float, basis: float) -> float:
     return raw - basis if direction == SELL_MAKER else raw + basis
 
 
-def roundtrip_fee_pct(maker_fee: float, taker_fee: float, close_taker_taker: bool = False, maker_venue_taker_fee: float = 0.0) -> float:
+def roundtrip_fee_pct(maker_fee: float, taker_fee: float, close_taker_taker: bool = False, maker_venue_taker_fee: float = 0.0,
+                      open_taker_taker: bool = False) -> float:
+    """Open + close fees of both legs (percent). The maker-venue leg pays its taker fee when that leg is an IOC."""
     close_maker_leg = maker_venue_taker_fee if close_taker_taker else maker_fee
-    return maker_fee + taker_fee + close_maker_leg + taker_fee
+    open_maker_leg = maker_venue_taker_fee if open_taker_taker else maker_fee
+    return open_maker_leg + taker_fee + close_maker_leg + taker_fee
 
 
 def adverse_funding_pct(direction: str, rate_maker: Optional[float], rate_taker: Optional[float], hours: float) -> float:

@@ -86,7 +86,7 @@ def _system_panel(eng: Engine):
     from rich.text import Text
     now = time.time()
     t = Text()
-    t.append("套利执行终端 v4\n", style="bold")
+    t.append("套利执行终端 v5\n", style="bold")
     if eng.live:
         t.append("运行模式：", style="cyan")
         t.append("实盘模式（执行真实订单）\n", style="bold yellow")
@@ -101,9 +101,18 @@ def _system_panel(eng: Engine):
     else:
         t.append("交易对：", style="cyan")
         t.append("无（仅监控）\n")
-    n_act = len(eng.active_ctxs()) if eng.active else 0
+    act = [c for c in eng.ctxs if eng.active and c.pair == eng.active]
+    if act:
+        modes = {(c.sym.execution.open_mode, c.sym.execution.close_mode) for c in act}
+        om, cm = next(iter(modes))
+        zh = {"maker_taker": "maker→taker", "taker_taker": "taker→taker"}
+        t.append("执行模式：", style="cyan")
+        t.append(f"开 {zh[om]} / 平 {zh[cm]}" + ("（按标的不同）" if len(modes) > 1 else "") + "\n")
+    n_auto = sum(1 for c in eng.ctxs if c.sym.auto)
+    n_trade = sum(1 for c in act if c.policy != "monitor" and not c.claim_block)
     t.append("监控标的：", style="cyan")
-    t.append(f"{len(eng.ctxs)} 个组合" + (f"，交易 {n_act} 个" if eng.active else "") + "\n")
+    t.append(f"{len(eng.ctxs)} 个组合" + (f"（自动 {n_auto}）" if n_auto else "")
+             + (f"，可开仓 {n_trade}/{len(act)}" if eng.active else "") + "\n")
     t.append("就绪：", style="cyan")
     t.append(f"{sum(1 for c in eng.ctxs if c.ready)}/{len(eng.ctxs)}")
     return t
@@ -203,9 +212,27 @@ def _risk_panel(eng: Engine):
     return t
 
 
+_SHORT = {"lighter": "Lighter", "lighter_rh": "RH", "entropy": "Entropy", "arcus": "Arcus"}
+
+
+def _nopen(c: Ctx) -> Optional[float]:
+    if c.next_open is not None:
+        return c.next_open
+    needs = [x for x in (c.need_sell, c.need_buy) if x is not None]
+    return min(needs) if needs else None
+
+
 def _ordered_ctxs(eng: Engine) -> list[Ctx]:
+    """Active pair first; within each group (ui.sort: gap) symbols with a position, then closest to the open
+    trigger (smallest need - dev), symbols without a quote last."""
     act = [c for c in eng.ctxs if eng.active and c.pair == eng.active]
     rest = [c for c in eng.ctxs if c not in act]
+    if getattr(eng.cfg, "ui", None) is None or eng.cfg.ui.sort == "gap":
+        def key(c: Ctx):
+            held = bool(eng.position(c).grids) if eng.active and c.pair == eng.active else False
+            return (not held, c.gap is None, c.gap if c.gap is not None else 0.0)
+        act.sort(key=key)
+        rest.sort(key=key)
     return act + rest
 
 
@@ -213,12 +240,14 @@ def _book_table(eng: Engine, max_rows: int):
     from rich.table import Table
     now = time.time()
     t = Table(title="实时订单簿价格 + 资金费率", expand=True, header_style="bold cyan", title_style="bold")
-    for col, kw in (("交易对", {}), ("代币", {}), ("maker 买1/卖1", {}), ("maker 费率(时/年化)", {}),
-                    ("taker 买1/卖1", {}), ("taker 费率(时/年化)", {}), ("费率差(年化)", {"justify": "right"}),
+    for col, kw in (("交易对", {}), ("代币", {}), ("maker 买1/卖1", {}), ("M费率 时/年", {}),
+                    ("taker 买1/卖1", {}), ("T费率 时/年", {}), ("费率差/年", {"justify": "right"}),
                     ("基差", {"justify": "right"}), ("偏离 卖/买 %", {"justify": "right"}), ("T1", {"justify": "right"}),
                     ("下次开/平", {"justify": "right"}), ("状态", {})):
-        t.add_column(col, overflow="fold", **kw)
+        t.add_column(col, no_wrap=True, overflow="ellipsis", **kw)  # one line per symbol (many symbols)
     rows = _ordered_ctxs(eng)
+    if eng.cfg.ui.max_book_rows:
+        max_rows = min(max_rows, eng.cfg.ui.max_book_rows)
     for c in rows[:max_rows]:
         M, T = eng.venues[c.pair.maker], eng.venues[c.pair.taker]
         mb, tb = M.book(c.maker_sym), T.book(c.taker_sym)
@@ -227,16 +256,24 @@ def _book_table(eng: Engine, max_rows: int):
         active = eng.active is not None and c.pair == eng.active
         status = _zh_status(c.disabled or c.status) + (f" ⚠{c.warn}" if c.warn else "")
         st_style = "green" if c.ready else ("red" if c.disabled or "error" in status else "yellow")
-        t.add_row(f"{c.pair.maker}→{c.pair.taker}", c.sym.key,
+        name = c.sym.key + ("·自动" if c.sym.auto else "")
+        if active and c.policy == "monitor" and c.ready and not c.disabled:
+            status = "就绪·仅监控" + (f" ⚠{c.warn}" if c.warn else "")
+        t.add_row(f"{_SHORT.get(c.pair.maker, c.pair.maker)}→{_SHORT.get(c.pair.taker, c.pair.taker)}", name,
                   f"{_lv(mb.best_bid if mb else None)} / {_lv(mb.best_ask if mb else None)}", _fund(fm),
                   f"{_lv(tb.best_bid if tb else None)} / {_lv(tb.best_ask if tb else None)}", _fund(ft), diff,
                   f"{c.basis_value:+.3f}{'' if c.ready else '*'}",
                   f"{_p(c.q_sell.dev if c.q_sell else None)} / {_p(c.q_buy.dev if c.q_buy else None)}",
                   f"{effective_t1(c.sym.strategy, now):.2f}",
-                  f"{_p(c.next_open, 2) if c.next_open is not None else '-'} / {_p(c.next_close, 2) if c.next_close is not None else '-'}",
+                  f"{_p(_nopen(c), 2)} / {_p(c.next_close, 2) if c.next_close is not None else '-'}",
                   f"[{st_style}]{status}[/]", style=None if active else "dim")
     if len(rows) > max_rows:
-        t.caption = f"另有 {len(rows) - max_rows} 行未显示（终端高度不够）；基差 * = EMA 预热中"
+        hidden = rows[max_rows:]
+        gaps = [c.gap for c in hidden if c.gap is not None]
+        near = sum(1 for g in gaps if g <= 0.05)
+        t.caption = (f"另有 {len(hidden)} 行未显示：就绪 {sum(1 for c in hidden if c.ready)}，"
+                     f"距开仓 ≤0.05% 的 {near} 个" + (f"，最近 {min(gaps):+.3f}%" if gaps else "")
+                     + "；按“距开仓门槛”排序；基差 * = EMA 预热中")
     else:
         t.caption = "基差 * = EMA 预热中 / 未就绪；偏离 = 扣除基差 EMA 后的可成交价差"
     return t
@@ -245,7 +282,10 @@ def _book_table(eng: Engine, max_rows: int):
 _ZH = (("ready", "就绪"), ("no fresh quotes", "行情不新鲜"), ("warmup", "预热"), ("blocked:", "受限:"),
        ("skipped:", "跳过:"), ("waiting", "等待"), ("close held by profit floor", "平仓被利润地板挡住"),
        ("signal, prices unstable", "信号出现但价格不稳"), ("fresh data", "新鲜行情"), ("price divergence", "价格偏离过大"),
-       ("basis warmup", "基差预热"), ("error:", "错误:"), ("paused", "暂停"), ("signal confirming", "信号确认中"))
+       ("basis warmup", "基差预热"), ("error:", "错误:"), ("paused", "暂停"), ("signal confirming", "信号确认中"),
+       ("open signal, prices unstable", "开仓信号但价格不稳"), ("liquidity filter warming up", "流动性统计中"),
+       ("book spread", "盘口点差"), ("depth ", "深度 "), ("auto symbol, not in rank top N", "自动标的，未进 rank 前 N"),
+       ("auto symbol (trade: none)", "自动标的"))
 
 
 def _zh_status(s: str) -> str:
@@ -401,8 +441,11 @@ def build_view(eng: Engine, height: Optional[int] = None):
     top_h = 12
     bottom_h = max(10, min(16, h // 4))
     mid_h = max(10, min(18, h // 3))
-    book_h = max(8, h - top_h - mid_h - bottom_h)
-    book_rows = max(3, min(n_books, book_h - 6))
+    if n_books > h - top_h - mid_h - bottom_h - 8:  # many symbols: give the price table more room
+        bottom_h = max(9, min(12, h // 5))
+        mid_h = max(10, min(14, h // 4))
+    book_h = max(9, h - top_h - mid_h - bottom_h)
+    book_rows = max(1, min(n_books, book_h - 8))  # borders, title, header, caption
 
     root = Layout()
     root.split_column(Layout(name="top", size=top_h), Layout(name="book", size=book_h),

@@ -79,6 +79,33 @@ guards:
   adverse_funding_warn_hours: 8  # warn when funding has been against the open position this long ...
   adverse_funding_warn_hourly_pct: 0.01  # ... at >= this net %/h
 
+# v5: add every symbol listed on >= min_venues venues (public market lists at start, cached in data/markets_cache.json).
+# Configured symbols below are never changed. Auto symbols are monitored; whether they may OPEN is `trade`:
+#   none     = monitor only (default; run monitor a day or two, then `arb rank`)
+#   filtered = when the live liquidity filter passes (book spread / depth below)
+#   ranked   = the top ranked_top_n of `arb rank --save` (data/rank.json) for this pair, plus the filter
+# CLI: --all-symbols turns it on for one run. `symbols: auto` = no hand-written symbols at all.
+auto_symbols:
+  enabled: true
+  min_venues: 2
+  trade: none
+  ranked_top_n: 15
+  include: []                    # whitelist: auto symbols that trade like configured ones, e.g. [NVDA, TSLA]
+  exclude: []                    # never add, e.g. [CASHCAT, USELESS]
+  max_symbols: null
+  max_book_spread_pct: 0.15      # filter: widest bid/ask spread of the two books (EMA ~60s)
+  min_depth_usdc: 300            # filter: thinnest side within risk.depth_levels on either book
+  filter_configured: false       # also apply the filter to the symbols configured below
+  categories: {}                 # fix a classification, e.g. {crypto: [ANSEM], us_equity: [CBRS]}
+  templates:                     # parameters per category (merged over defaults)
+    us_equity: {strategy: {session: us_equity, initial_threshold_pct: 0.30, grid_step_pct: 0.15, offhours_threshold_pct: 0.60}}
+    crypto: {strategy: {initial_threshold_pct: 0.20, grid_step_pct: 0.10}}
+    other: {strategy: {initial_threshold_pct: 0.40, grid_step_pct: 0.20}}   # pre-IPO, non-US stocks, FX, metals, unknown
+
+ui:
+  sort: gap                      # gap: positions first, then closest to the open trigger | config: file order
+  max_book_rows: null            # null = as many as the terminal fits; the rest is summarised below the table
+
 paths:
   data_dir: data
   log_dir: logs
@@ -99,6 +126,7 @@ defaults:
     min_close_profit_pct: 0.01   # null disables
     close_floor_timeout_s: 600
     signal_confirm_s: 0          # >0: an open signal must hold continuously this long (spread persistence; join/improve modes)
+    offhours_open: true          # us_equity: false = no new opens outside NY regular hours (closes keep working)
   basis:
     enabled: true
     ema_seconds: 3600
@@ -114,7 +142,8 @@ defaults:
     hedge_slippage_pct: 0.05
     hedge_max_attempts: 4        # counts only zero-filled IOCs; partial fills keep hedging
     hedge_min_notional_usdc: 10  # accumulate partial maker fills (dust) until the hedge is >= this
-    close_mode: maker_taker
+    close_mode: maker_taker      # maker_taker | taker_taker (both legs IOC); CLI: --close-mode
+    open_mode: maker_taker       # maker_taker | taker_taker (IOC on both venues, both taker fees); CLI: --open-mode
     emergency_unwind: false      # false: on hedge failure keep both legs, cancel makers, lock for manual intervention
   risk:
     min_available_usdc: 100

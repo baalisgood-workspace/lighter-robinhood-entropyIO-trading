@@ -23,8 +23,8 @@ def base_of(venue: str, name: str) -> str:
     return ALIASES.get(n, n)
 
 
-async def _fetch(session, cfg: AppConfig, venue: str) -> dict[str, str]:
-    """{base symbol: venue market name} of active perps."""
+async def _fetch(session, cfg: AppConfig, venue: str, meta: Optional[dict] = None) -> dict[str, str]:
+    """{base symbol: venue market name} of active perps. `meta` collects Arcus categories {base: category}."""
     v = cfg.venues[venue]
     url = v.rest_url.rstrip("/")
     out: dict[str, str] = {}
@@ -43,6 +43,8 @@ async def _fetch(session, cfg: AppConfig, venue: str) -> dict[str, str]:
             name = m.get("marketDisplayName")
             if name and m.get("status") == "ONLINE":
                 out[base_of(venue, name)] = name
+                if meta is not None and m.get("category"):
+                    meta[base_of(venue, name)] = str(m["category"]).upper()
     else:
         async with session.post(url + "/info", json={"type": "meta", "dex": v.dex}, allow_redirects=False) as r:
             data = await r.json(content_type=None)
@@ -52,15 +54,17 @@ async def _fetch(session, cfg: AppConfig, venue: str) -> dict[str, str]:
     return out
 
 
-async def fetch_all(cfg: AppConfig, venues: Optional[list[str]] = None) -> dict[str, dict[str, str]]:
+async def fetch_all(cfg: AppConfig, venues: Optional[list[str]] = None, meta: Optional[dict] = None,
+                    quiet: bool = False) -> dict[str, dict[str, str]]:
     from arb.venues.transport import http_session
     names = venues or list(VENUE_NAMES)
     res: dict[str, dict[str, str]] = {}
     async with http_session() as s:
-        got = await asyncio.gather(*[_fetch(s, cfg, n) for n in names], return_exceptions=True)
+        got = await asyncio.gather(*[_fetch(s, cfg, n, meta) for n in names], return_exceptions=True)
     for n, g in zip(names, got):
         if isinstance(g, Exception):
-            print(f"{n}: market list failed: {g}")
+            if not quiet:
+                print(f"{n}: market list failed: {g}")
             res[n] = {}
         else:
             res[n] = g
