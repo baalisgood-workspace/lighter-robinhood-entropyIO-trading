@@ -318,6 +318,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--env-file", default=".env")
     ap.add_argument("--log-level", default="INFO")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    # the global options are also accepted after the sub-command (./start.sh check --config ...)
+    g = argparse.ArgumentParser(add_help=False)
+    g.add_argument("--config", default=argparse.SUPPRESS)
+    g.add_argument("--env-file", default=argparse.SUPPRESS)
+    g.add_argument("--log-level", default=argparse.SUPPRESS)
+    _add_parser = sub.add_parser
+    sub.add_parser = lambda *a, **k: _add_parser(*a, parents=[g, *k.pop("parents", [])], **k)
 
     def common(p):
         p.add_argument("--venues", help="comma list overriding venues.*.enabled, e.g. lighter,entropy")

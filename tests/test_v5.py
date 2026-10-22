@@ -263,3 +263,14 @@ def test_monitor_only_not_reconciled_and_foreign_position_skipped(tmp_path, fake
     T.positions = pos
     assert asyncio.run(eng.reconcile(initial=True)) is True  # no startup mismatch error
     assert "not opened by this bot" in c.claim_block and eng.active_ctxs() == []
+
+
+
+def test_global_options_after_subcommand(capsys):
+    from arb import cli
+    for argv in (["check", "--config", "/nonexistent_v5.yaml", "--venues", "lighter,lighter_rh"],
+                 ["--config", "/nonexistent_v5.yaml", "check"],
+                 ["rank", "--log-level", "WARNING", "--config", "/nonexistent_v5.yaml"]):
+        assert cli.main(argv) == 2
+        err = capsys.readouterr().err
+        assert "unrecognized arguments" not in err and "/nonexistent_v5.yaml" in err
