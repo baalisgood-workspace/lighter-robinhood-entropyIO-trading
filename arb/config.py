@@ -63,6 +63,12 @@ class VenueConfig:
     unknown_lookup_s: float = 20.0  # IOC with ambiguous send result: keep looking it up this long before halting
     liveness_s: float = 5.0  # WS: protocol ping every liveness/2; any received frame counts as alive
     quick_resume_s: float = 10.0  # WS: socket closed when silent for liveness + quick_resume
+    # v5.2: finished orders keep receiving exchange pushes this long; a fill that arrives after the executor
+    # forgot the order is a "late fill" and is booked as residual (then hedged / flattened by the engine)
+    late_fill_grace_s: float = 120.0
+    # re-read every canceled maker order from REST after these delays (null: on for arcus, off for lighter)
+    verify_cancel_rest: Optional[bool] = None
+    verify_cancel_delays_s: list = field(default_factory=lambda: [2.0, 8.0])
 
     @property
     def kind(self) -> str:
@@ -166,6 +172,11 @@ class RiskConfig:
     max_daily_opens: Optional[int] = None  # open slices per UTC day per symbol
     reduce_only_block_s: float = 1800.0  # venue rejected an opening order with "reduce only": block opens this long
     max_hold_hours: Optional[float] = None  # warn (UI/event) when the oldest grid is older than this
+    # ---- v5.2 auto-align (opt-in): a reconcile mismatch on ONE leg only (the other leg matches local state),
+    # identical on two consecutive checks and worth at most this much, is adopted as residual (then settled
+    # like any residual) instead of halting. 0 = off (always halt, as before). Capped per symbol per hour.
+    auto_adopt_max_usdc: float = 0.0
+    auto_adopt_max_per_hour: int = 3
 
 
 @dataclass

@@ -364,7 +364,7 @@ class LighterVenue(Venue):
 
     def _apply_order_json(self, o: dict) -> bool:
         coi = str(o.get("client_order_index", o.get("client_order_id", "")))
-        st = self.orders.get(coi)
+        st = self._lookup(coi)
         if st is None:
             return False
         filled = D(o.get("filled_base_amount") or 0)
@@ -480,6 +480,13 @@ class LighterVenue(Venue):
         d = await self._find_order(st)
         if d is not None:
             self._apply_order_json(d)
+        elif (st.post_only and not st.exchange_id and not st.status.final
+              and time.time() - st.created > max(10.0, self.cfg.unknown_lookup_s)):
+            # accepted by the API but never seen on the book (no push, not active, not inactive): the sequencer
+            # dropped it (e.g. reduce-only with no position left). Treated as canceled with nothing filled; it
+            # stays watched for late pushes (late_fill_grace_s) and the reconcile is the final backstop.
+            st.apply(status=OrderStatus.CANCELED, reason="not found on exchange (never reached the book)")
+            log.warning("%s maker order %s never appeared on the exchange - treated as canceled", self.name, st.client_id)
         elif st.status == OrderStatus.UNKNOWN and time.time() - st.created > 30:
             # never reached the sequencer: not active, not inactive after 30s
             st.apply(status=OrderStatus.REJECTED, reason="not found on exchange")

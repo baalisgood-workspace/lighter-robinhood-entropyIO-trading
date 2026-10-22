@@ -268,7 +268,7 @@ class EntropyVenue(Venue):
 
     def _client_for(self, order: dict) -> Optional[str]:
         cloid = order.get("cloid")
-        if cloid and cloid in self.orders:
+        if cloid and self._lookup(cloid) is not None:
             return cloid
         oid = order.get("oid")
         return self._by_oid.get(int(oid)) if oid is not None else None
@@ -276,9 +276,9 @@ class EntropyVenue(Venue):
     def _apply_order_update(self, upd: dict) -> None:
         o = upd.get("order") or {}
         cid = self._client_for(o)
-        if cid is None or cid not in self.orders:
+        st = self._lookup(cid) if cid is not None else None
+        if st is None:
             return
-        st = self.orders[cid]
         filled = D(o.get("origSz") or 0) - D(o.get("sz") or 0)
         self._by_oid[int(o["oid"])] = cid
         status = map_hl_status(str(upd.get("status", "")))
@@ -294,9 +294,9 @@ class EntropyVenue(Venue):
         oid = int(oid)
         per = self._fills.setdefault(oid, {})
         per[int(f.get("tid", len(per)))] = (D(f["sz"]), D(f["px"]))
-        cid = self._by_oid.get(oid) or (f.get("cloid") if f.get("cloid") in self.orders else None)
-        if cid and cid in self.orders:
-            st = self.orders[cid]
+        cid = self._by_oid.get(oid) or (f.get("cloid") if self._lookup(str(f.get("cloid"))) is not None else None)
+        st = self._lookup(cid) if cid else None
+        if st is not None:
             total = sum(sz for sz, _ in per.values())
             st.apply(filled=total)
             self._recompute_avg(st)

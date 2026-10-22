@@ -7,6 +7,7 @@ the venue-native names (e.g. "OPENAI" on Lighter, "io:OAI" on Entropy).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections import deque
@@ -16,6 +17,8 @@ from typing import Optional
 
 from arb.models import Balance, MarketInfo, OrderBook, OrderState, OrderStatus, Position
 from arb.util import floor_to_step, round_to_step
+
+log = logging.getLogger("arb.venue")
 
 
 class VenueError(RuntimeError):
@@ -58,6 +61,11 @@ class Venue(ABC):
         self.alarm_count = 0
         self.failures: deque = deque(maxlen=500)  # (seq, ts, kind, detail) API failures, read by the engine guards
         self.failure_seq = 0
+        # v5.2 late fills: finished orders stay reachable for exchange pushes / REST re-reads for a grace
+        # period after the executor forgot them. A fill that shows up there was never seen by the executor
+        # (typical race: the CANCELED push arrives before the fill push) and is handed to the engine.
+        self._retired: dict[str, list] = {}  # client_id -> [state, filled already accounted, expires_at]
+        self.late_fills: list[dict] = []  # drained by the engine
 
     # ------------------------------------------------------------ liveness / health
     def mark_alive(self) -> None:
@@ -161,6 +169,72 @@ class Venue(ABC):
         ev = self._order_events.get(client_id)
         if ev:
             ev.set()
+        if client_id in self._retired:
+            self._check_late(client_id)
+
+    def _lookup(self, client_id: str) -> Optional[OrderState]:
+        """Live order, or a recently finished one still inside the late-fill grace period."""
+        st = self.orders.get(client_id)
+        if st is not None:
+            return st
+        r = self._retired.get(client_id)
+        return r[0] if r is not None else None
+
+    def _check_late(self, client_id: str) -> None:
+        r = self._retired.get(client_id)
+        if r is None:
+            return
+        st, seen, _exp = r
+        if st.filled > seen:
+            delta = st.filled - seen
+            r[1] = st.filled
+            px = st.avg_price or st.price
+            fill = {"ts": time.time(), "venue": self.name, "symbol": st.symbol, "is_buy": st.is_buy, "qty": delta,
+                    "price": px, "client_id": st.client_id, "post_only": st.post_only}
+            self.late_fills.append(fill)
+            log.warning("%s LATE FILL %s %s %s @ %s (order %s already finished, %s accounted before)", self.name,
+                        st.symbol, "buy" if st.is_buy else "sell", delta, px, st.client_id, seen)
+            self.alarm("late_fill", st.symbol, f"{st.client_id} {'buy' if st.is_buy else 'sell'} {delta}")
+
+    def drain_late_fills(self) -> list[dict]:
+        out, self.late_fills = self.late_fills, []
+        return out
+
+    def drop_retired(self, symbol: Optional[str] = None) -> None:
+        """Stop watching finished orders (all, or one symbol): after a reconcile adopted the exchange position,
+        a later push for them must not be counted a second time."""
+        for cid in [c for c, r in self._retired.items() if symbol is None or r[0].symbol == symbol]:
+            self._retired.pop(cid, None)
+
+    def _prune_retired(self) -> None:
+        now = time.time()
+        for cid in [c for c, r in self._retired.items() if r[2] < now]:
+            self._retired.pop(cid, None)
+
+    def _verify_retired_later(self, st: OrderState) -> None:
+        """Re-read a finished (canceled) maker order from REST after it was forgotten, so a fill the push
+        streams delivered late or never is still found. Enabled per venue (verify_cancel_rest)."""
+        delays = [d for d in (getattr(self.cfg, "verify_cancel_delays_s", None) or []) if d > 0]
+        if not delays:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def run() -> None:
+            waited = 0.0
+            for d in sorted(delays):
+                await asyncio.sleep(max(0.0, d - waited))
+                waited = d
+                if st.client_id not in self._retired:
+                    return
+                try:
+                    await self.refresh_order(st)
+                except Exception as exc:  # noqa: BLE001 - best effort, the reconcile is the backstop
+                    log.debug("%s late-fill re-read %s failed: %s", self.name, st.client_id, exc)
+                self._check_late(st.client_id)
+        loop.create_task(run())
 
     async def wait_order(self, st: OrderState, timeout: float) -> bool:
         """Wait for a push update of this order. Returns True if an update arrived."""
@@ -177,6 +251,12 @@ class Venue(ABC):
         if st.status.final:
             self.orders.pop(st.client_id, None)
             self._order_events.pop(st.client_id, None)
+            self._prune_retired()
+            grace = float(getattr(self.cfg, "late_fill_grace_s", 0) or 0)
+            if grace > 0 and st.status != OrderStatus.REJECTED:
+                self._retired[st.client_id] = [st, st.filled, time.time() + grace]
+                if st.post_only and st.status == OrderStatus.CANCELED and getattr(self.cfg, "verify_cancel_rest", False):
+                    self._verify_retired_later(st)
 
     @abstractmethod
     async def place_post_only(self, symbol: str, is_buy: bool, qty: Decimal, price: Decimal, reduce_only: bool) -> OrderState: ...

@@ -109,6 +109,8 @@ class Engine:
         self.balances: dict[str, Balance] = {}
         self.exch_positions: dict[str, dict[str, Position]] = {}
         self.mismatch_strikes = 0
+        self._last_mismatch: dict[str, tuple] = {}  # ctx key -> (maker delta, taker delta) of the previous check
+        self._adoptions: dict[str, deque] = {}  # ctx key -> timestamps of auto-adopted mismatches
         self.reconciled_ok = False
         self.exec_tasks: dict[str, asyncio.Task] = {}  # ctx key -> in-flight slice
         self.inflight: dict[str, ExecPlan] = {}
@@ -315,6 +317,7 @@ class Engine:
         pm, pt = await M.positions(), await T.positions()
         self.exch_positions[M.name], self.exch_positions[T.name] = pm, pt
         problems = []
+        deltas: list[tuple] = []  # (ctx, maker delta, taker delta, tolerance)
         rows = []
         for c in self.active_ctxs():
             sp = self.position(c)
@@ -332,6 +335,7 @@ class Engine:
                 rows.append(dict(symbol=c.sym.key, maker=am, maker_exp=sp.expected_maker_qty(), taker=at,
                                  taker_exp=sp.expected_taker_qty(), ok=abs(dm) <= tol and abs(dt) <= tol))
             if abs(dm) > tol or abs(dt) > tol:
+                deltas.append((c, dm, dt, tol))
                 problems.append(f"{c.sym.key}: {M.name} {am} (expected {sp.expected_maker_qty()}), "
                                 f"{T.name} {at} (expected {sp.expected_taker_qty()})")
         self.last_check = dict(ts=time.time(), ok=not problems, rows=rows, problems=problems)
@@ -345,11 +349,88 @@ class Engine:
             self.mismatch_strikes += 1
             self.event(f"position mismatch ({self.mismatch_strikes}): {'; '.join(problems)}", logging.WARNING)
             if self.mismatch_strikes >= 2 and not self.cfg.allow_preexisting_positions:
-                self.halt("positions do not match local state: " + "; ".join(problems))
+                why = self._adopt_mismatches(deltas)
+                if why:
+                    self.halt("positions do not match local state: " + "; ".join(problems) + f" [{why}]")
+                else:
+                    self.mismatch_strikes = 0
+                    problems = []
         elif not problems:
             self.mismatch_strikes = 0
+        self._last_mismatch = {c.key: (dm, dt) for c, dm, dt, _ in deltas} if problems else {}
         self.reconciled_ok = not problems
         return not problems
+
+    def _adopt_mismatches(self, deltas: list[tuple]) -> str:
+        """v5.2 auto-align (opt-in). Adopt every mismatch as residual if ALL are adoptable; else return why not.
+        Adoptable: only one leg differs (the other matches local state), the same delta was seen on the
+        previous check, its value is <= risk.auto_adopt_max_usdc and the hourly budget is not used up."""
+        assert self.active is not None
+        now = time.time()
+        plan = []
+        for c, dm, dt, tol in deltas:
+            rk = c.sym.risk
+            if rk.auto_adopt_max_usdc <= 0:
+                return "auto-align off (risk.auto_adopt_max_usdc: 0)"
+            if abs(dm) > tol and abs(dt) > tol:
+                return f"{c.sym.key}: both legs differ"
+            if self._last_mismatch.get(c.key) != (dm, dt):
+                return f"{c.sym.key}: mismatch not identical on two checks"
+            maker_leg = abs(dm) > tol
+            vname, sym, d = (c.pair.maker, c.maker_sym, dm) if maker_leg else (c.pair.taker, c.taker_sym, dt)
+            b = self.venues[vname].book(sym)
+            px = b.mid if b is not None and b.mid else None
+            if px is None:
+                return f"{c.sym.key}: no price on {vname}"
+            value = float(abs(d) * px)
+            if value > rk.auto_adopt_max_usdc:
+                return f"{c.sym.key}: {value:.2f} USDC > auto_adopt_max_usdc {rk.auto_adopt_max_usdc:g}"
+            hist = self._adoptions.setdefault(c.key, deque())
+            while hist and now - hist[0] > 3600:
+                hist.popleft()
+            if len(hist) >= rk.auto_adopt_max_per_hour:
+                return f"{c.sym.key}: auto_adopt_max_per_hour {rk.auto_adopt_max_per_hour} used up"
+            plan.append((c, maker_leg, vname, sym, d, value))
+        for c, maker_leg, vname, sym, d, value in plan:
+            sp = self.position(c)
+            attr = "residual_maker" if maker_leg else "residual_taker"
+            setattr(sp, attr, getattr(sp, attr) + d)
+            self.venues[vname].drop_retired(sym)  # a later push for those orders must not be counted again
+            self._adoptions[c.key].append(now)
+            self.journal("adopt_mismatch", symbol=c.sym.key, venue=vname, delta=d, value_usdc=round(value, 4),
+                         residual_maker=sp.residual_maker, residual_taker=sp.residual_taker)
+            self.event(f"WARNING {c.sym.key}: {vname} position differs from local state by {d} ({value:.2f} USDC)"
+                       f" - adopted as residual (auto-align)", logging.WARNING)
+        self.positions.save()
+        return ""
+
+    def _book_late_fills(self) -> None:
+        """v5.2: fills of orders the executor had already finished are booked as residual of their leg."""
+        if self.active is None:
+            return
+        for vname in (self.active.maker, self.active.taker):
+            v = self.venues.get(vname)
+            if v is None:
+                continue
+            for f in v.drain_late_fills():
+                signed = f["qty"] if f["is_buy"] else -f["qty"]
+                ctx = next((c for c in self.active_ctxs() if
+                            (vname == c.pair.maker and f["symbol"] == c.maker_sym) or
+                            (vname == c.pair.taker and f["symbol"] == c.taker_sym)), None)
+                self.journal("late_fill", venue=vname, symbol=f["symbol"], qty=signed, price=f["price"],
+                             client_id=f["client_id"], booked=ctx is not None)
+                if ctx is None:
+                    self.event(f"WARNING late fill {f['symbol']} {signed} on {vname} for an untracked symbol", logging.WARNING)
+                    continue
+                sp = self.position(ctx)
+                if vname == ctx.pair.maker:
+                    sp.residual_maker += signed
+                else:
+                    sp.residual_taker += signed
+                self.positions.save()
+                self.reconcile_due = True  # check positions and settle the residual soon
+                self.event(f"WARNING {ctx.sym.key}: late fill {signed} on {vname} (order {f['client_id']} had already "
+                           f"finished) - booked as residual", logging.WARNING)
 
     def halt(self, reason: str) -> None:
         """Stop all new orders, cancel every maker, keep positions, lock until manual intervention."""
@@ -424,6 +505,10 @@ class Engine:
             for k in [k for k, t in self.exec_tasks.items() if t.done()]:
                 self.exec_tasks.pop(k)
                 self.inflight.pop(k, None)
+            try:
+                self._book_late_fills()
+            except Exception:  # noqa: BLE001
+                log.exception("late fill booking")
             self.guards.tick(now)
             self.pause_text = self.guards.global_reason(now)
             if self.live and not self.halted and not self.stopping and not self.reconcile_due and not self.pause_text:

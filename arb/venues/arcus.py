@@ -73,6 +73,8 @@ class ArcusUnknown(VenueError):
 class ArcusVenue(Venue):
     def __init__(self, cfg, env=None):
         super().__init__(cfg, env)
+        if getattr(cfg, "verify_cancel_rest", None) is None:
+            cfg.verify_cancel_rest = True  # v5.2: Arcus pushes CANCELED and the fill on separate channels
         p = cfg.env_prefix
         self.address = (self.env.get(f"{p}_ACCOUNT_ADDRESS") or "").strip().lower()
         self.account_index = int((self.env.get(f"{p}_ACCOUNT_INDEX") or "0").strip() or 0)
@@ -326,11 +328,11 @@ class ArcusVenue(Venue):
     # ------------------------------------------------------------ order state
     def _state_for(self, row: dict) -> Optional[OrderState]:
         cid = row.get("clientId")
-        if cid is not None and str(cid) in self.orders:
-            return self.orders[str(cid)]
+        if cid is not None and self._lookup(str(cid)) is not None:
+            return self._lookup(str(cid))
         oid = row.get("orderId")
         if oid is not None and str(oid) in self._by_oid:
-            return self.orders.get(self._by_oid[str(oid)])
+            return self._lookup(self._by_oid[str(oid)])
         return None
 
     def _foreign(self, st: OrderState, r: dict) -> bool:
@@ -389,6 +391,11 @@ class ArcusVenue(Venue):
             zero_size = size is not None and D(str(size)) <= 0
         except Exception:  # noqa: BLE001
             zero_size = True
+        if zero_size and raw_status == "REJECTED" and st.client_id not in self.orders:
+            # rejection push for an order we already finished (typically our cancel raced a fill): re-read it
+            log.info("arcus: request rejection push for finished order %s, re-reading order state", st.client_id)
+            self._verify_retired_later(st)
+            return
         if zero_size and raw_status == "REJECTED":
             # Arcus pushes a zero-value REJECTED row (size 0, market 0, side BUY) when a REQUEST is rejected.
             # Only an order we have nothing but the placeOrder ACK for (no real row, nothing filled, no cancel

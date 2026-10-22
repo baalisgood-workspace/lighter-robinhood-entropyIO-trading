@@ -340,6 +340,11 @@ class Executor:
                     log.warning("cancel failed: %s", exc)
                 # a replacement is only placed after the cancel reached a terminal state
                 await M.wait_final(o, ex.order_final_timeout_s, poll=ex.order_poll_interval_s)
+                if not o.status.final and not o.exchange_id:
+                    # never confirmed by the exchange (no push, no REST row yet): keep looking it up a while
+                    # longer (the venue resolves it as canceled when it never reached the book)
+                    await M.wait_final(o, max(0.0, float(getattr(M.cfg, "unknown_lookup_s", 0) or 0)),
+                                       poll=max(3.0, ex.order_poll_interval_s))
             absorb(o)
             if not o.status.final:
                 raise ExecutionHalt(f"maker order {o.client_id} on {M.name} not final after cancel ({o.status.value})")
@@ -434,13 +439,18 @@ class Executor:
                     except Exception as exc:  # noqa: BLE001
                         log.debug("refresh failed: %s", exc)
                 absorb(order)
-                await hedge_pending()
+                if not order.status.final:
+                    await hedge_pending()
+                    absorb(order)  # v5.2: fills that arrived while the hedge was running
 
                 if order.status.final:
+                    # absorbed just above with nothing awaited in between: forgetting cannot lose a fill
+                    # (v5.1 forgot an order that finished during the hedge without reading its last fill)
                     M.forget(order)
                     if order.status == OrderStatus.CANCELED and "post-only" in (order.reason or ""):
                         requotes += 1
                     order = None
+                    await hedge_pending()
                     continue
 
                 # ---------- cancel / requote conditions (risk cancels bypass the replacement throttle)
