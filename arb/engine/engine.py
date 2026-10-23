@@ -83,6 +83,7 @@ class Ctx:
     need_sell: Optional[float] = None  # open trigger incl. fees + funding (flat: level 1), per direction
     need_buy: Optional[float] = None
     gap: Optional[float] = None  # min(need - dev) over directions: <= 0 means an open signal
+    unclosable: str = ""  # v5.3: why the top grid cannot be closed right now (warned once per change)
 
     @property
     def key(self) -> str:
@@ -758,25 +759,43 @@ class Engine:
         if sp.grids:
             top = sp.grids[-1]
             cdir = sg.CLOSE_DIRECTION[sp.direction]
-            qty = min(c.qty, self._rq(c, top.qty))
-            if top.qty - qty < min_qty:  # do not leave an untradable remainder
-                qty = self._rq(c, top.qty)
+            # v5.3: maker fills of an earlier close whose hedge is still missing (close-sign maker residual) are
+            # hedged together with this close; the maker order only covers what is still open on the maker venue
+            pend = ZERO if tt else min(self._carry(c, sp, cdir), sp.total_qty)
+            top_open = top.qty - pend
+            qty = min(c.qty, self._rq(c, max(ZERO, top_open)))
+            rem = top_open - qty
+            if rem < min_qty or not self._sized_ok(c, rem):  # do not leave an untradable remainder
+                qty = self._rq(c, max(ZERO, top_open))
             cl = sg.close_level(t1, st.grid_step_pct, st.first_close_ratio, top.level)
             c.next_close = cl
             mb, tb = M.book(c.maker_sym), T.book(c.taker_sym)
-            q = sg.build_quote(cdir, mb, tb, qty, c.basis_value, ex.maker_price_mode if not thr else "join",
-                               M.price_tick_at(c.maker_sym, mb.mid), rk.depth_levels, rk.depth_band_pct, maker_as_taker=tt)
+            why = ""
+            if pend > 0 and qty < min_qty:
+                why = f"close hedge pending: {pend} on {c.pair.taker} (paired off after the reconcile)"
+            elif not self._taker_ok(c, qty + pend):
+                why = (f"not closable: {qty + pend} {c.taker_sym} is below the {c.pair.taker} minimum order "
+                       f"({T.market(c.taker_sym).min_qty} / {T.market(c.taker_sym).min_notional} USDC)")
+            if why != c.unclosable:
+                if why:
+                    self.event(f"{c.sym.key}: {why}", logging.WARNING)
+                c.unclosable = why
+            q = None
+            if why:
+                c.status = why
+            else:
+                q = sg.build_quote(cdir, mb, tb, qty, c.basis_value, ex.maker_price_mode if not thr else "join",
+                                   M.price_tick_at(c.maker_sym, mb.mid), rk.depth_levels, rk.depth_band_pct, maker_as_taker=tt)
             floor = None
-            if st.min_close_profit_pct is not None:
+            if q is not None and st.min_close_profit_pct is not None:
                 floor = top.close_floor(qty, now, st.close_floor_timeout_s, st.min_close_profit_pct)
-            if q.ok and qty >= min_qty:
+            if q is not None and q.ok and qty >= min_qty:
                 gap = (-q.dev) - cl  # close when -dev <= cl
                 if floor is not None:
                     gap = max(gap, floor - q.raw)
                 plan = ExecPlan("close", c.pair, c.sym, c.maker_sym, c.taker_sym, cdir, qty, top.level, -cl, basis_fn,
                                 taker_taker=tt, required_raw=floor)
-                if not tt and plan.qty + self._carry(c, sp, cdir) <= sp.total_qty:
-                    plan.carry_in = self._carry(c, sp, cdir)
+                plan.carry_in = pend
                 if gap <= 0 and not thr:
                     if not self._stable(c):
                         c.status = "close signal, prices unstable"
@@ -872,6 +891,22 @@ class Engine:
         if held < st.signal_confirm_s:
             c.status = f"signal confirming {held:.1f}/{st.signal_confirm_s:g}s"
             return False
+        return True
+
+    def _taker_ok(self, c: Ctx, q: Decimal) -> bool:
+        """v5.3: the taker venue accepts q (exchange minimums, 5% price margin): a close the taker cannot hedge
+        is not quoted (v5.2 filled it on the maker venue, skipped the hedge and flattened the maker again)."""
+        T = self.venues[c.pair.taker]
+        m, b = T.market(c.taker_sym), T.book(c.taker_sym)
+        return bool(b and b.mid) and q > 0 and q >= m.min_qty and q * b.mid >= m.min_notional * Decimal("1.05")
+
+    def _sized_ok(self, c: Ctx, q: Decimal) -> bool:
+        """q meets the minimum order value on both venues."""
+        for vname, sym in ((c.pair.maker, c.maker_sym), (c.pair.taker, c.taker_sym)):
+            v = self.venues[vname]
+            b = v.book(sym)
+            if not b or not b.mid or q * b.mid < v.market(sym).min_notional:
+                return False
         return True
 
     def _carry(self, c: Ctx, sp: SymbolPosition, direction: str) -> Decimal:
@@ -1008,10 +1043,46 @@ class Engine:
         else:
             c.failures = 0
 
+    async def _pair_off(self, c: Ctx, sp: SymbolPosition) -> bool:
+        """v5.3: a close whose maker leg filled while its hedge could not be sent leaves a maker residual with the
+        CLOSE sign. Flattening it on the maker venue re-opens the position that was just closed (v5.2 looped on
+        PUMP this way); the taker leg of the grid is closed instead (IOC, reduce-only) and both are paired off.
+        Returns True when this symbol's residual is handled here (also: too small, waits for the next close)."""
+        if not sp.grids:
+            return False
+        cdir = sg.CLOSE_DIRECTION[sp.direction]
+        r = min(self._carry(c, sp, cdir), sp.total_qty)
+        if r <= 0:
+            return False
+        T = self.venues[c.pair.taker]
+        q = T.round_qty(c.taker_sym, r)
+        if self.guards.venue_paused(c.pair.taker, time.time()) or not self._taker_ok(c, q):
+            return True  # never flattened on the maker venue; hedged together with the next close slice
+        st = await self.executor._ioc(T, c.taker_sym, not sg.maker_is_buy(cdir), q, True,
+                                      c.sym.execution.hedge_slippage_pct, c.sym.risk.max_quote_age_s)
+        if st is None:
+            return True
+        if st.status.value == "unknown":
+            self.halt(f"pair-off order on {c.pair.taker} has unknown outcome")
+            return True
+        if st.filled > 0:
+            s_m = Decimal(1) if sg.maker_is_buy(cdir) else Decimal(-1)
+            sp.residual_maker -= s_m * st.filled
+            sp.reduce_close(st.filled)
+            self.positions.save()
+            self.journal("pair_off", symbol=c.sym.key, venue=c.pair.taker, qty=st.filled, price=st.avg_price or st.price,
+                         residual_maker=sp.residual_maker, residual_taker=sp.residual_taker)
+            self.event(f"residual {c.sym.key}: close hedge paired off on {c.pair.taker}: {st.filled}")
+        return True
+
     async def _fix_residuals(self) -> None:
         """Flatten unhedged leftovers that became tradable (only after a clean reconcile)."""
         for c in self.active_ctxs():
             sp = self.position(c)
+            if await self._pair_off(c, sp):
+                if self.halted:
+                    return
+                continue
             for vname, sym, attr in ((c.pair.maker, c.maker_sym, "residual_maker"), (c.pair.taker, c.taker_sym, "residual_taker")):
                 r = getattr(sp, attr)
                 if r == 0:

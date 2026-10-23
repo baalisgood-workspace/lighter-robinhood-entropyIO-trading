@@ -125,7 +125,11 @@ class Executor:
 
     def _hedge_ok(self, plan: ExecPlan, qty: Decimal, px: Decimal) -> bool:
         T = self.venues[plan.pair.taker]
-        return self._tradable(T, plan.taker_sym, qty, px) and qty * px >= Decimal(str(plan.sym.execution.hedge_min_notional_usdc))
+        if not self._tradable(T, plan.taker_sym, qty, px):
+            return False
+        # v5.3: a close hedges the grid it closes - waiting for more fills (hedge_min_notional_usdc) cannot help
+        # there, only the exchange minimums apply
+        return plan.kind == "close" or qty * px >= Decimal(str(plan.sym.execution.hedge_min_notional_usdc))
 
     def _taker_vwap(self, plan: ExecPlan, qty: Decimal) -> Optional[Decimal]:
         rk = plan.sym.risk
@@ -343,7 +347,7 @@ class Executor:
                 if not o.status.final and not o.exchange_id:
                     # never confirmed by the exchange (no push, no REST row yet): keep looking it up a while
                     # longer (the venue resolves it as canceled when it never reached the book)
-                    await M.wait_final(o, max(0.0, float(getattr(M.cfg, "unknown_lookup_s", 0) or 0)),
+                    await M.wait_final(o, max(0.0, M.unacked_resolve_s() - (time.time() - o.created)),
                                        poll=max(3.0, ex.order_poll_interval_s))
             absorb(o)
             if not o.status.final:
@@ -425,6 +429,12 @@ class Executor:
                         continue
                     if order.status == OrderStatus.UNKNOWN:
                         await M.wait_final(order, ex.order_final_timeout_s, poll=ex.order_poll_interval_s)
+                        if order.status in (OrderStatus.UNKNOWN, OrderStatus.PENDING) and not order.exchange_id:
+                            # v5.3: send result lost (e.g. connection reset): keep looking the order up until the
+                            # venue finds it or resolves it as never placed, instead of halting at once
+                            left = M.unacked_resolve_s() - (time.time() - order.created)
+                            if left > 0:
+                                await M.wait_final(order, left, poll=max(3.0, ex.order_poll_interval_s))
                         if order.status in (OrderStatus.UNKNOWN, OrderStatus.PENDING):
                             raise ExecutionHalt(f"maker order {order.client_id} on {M.name} outcome unknown")
                     continue

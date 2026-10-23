@@ -529,11 +529,19 @@ class ArcusVenue(Venue):
         await self._submit(st, "MARKET", "IOC")
         if st.status == OrderStatus.REJECTED:
             return st
-        timeout = max(8.0, self.cfg.unknown_lookup_s) if st.status == OrderStatus.UNKNOWN else 8.0
+        # v5.3: an IOC whose send result was lost is looked up until refresh_order can resolve it
+        timeout = max(8.0, self.unacked_resolve_s()) if st.status == OrderStatus.UNKNOWN else 8.0
         return await self.wait_final(st, timeout=timeout, poll=1.0)
+
+    def unacked_resolve_s(self) -> float:
+        return self._not_found_s() + 5.0
+
+    def _not_found_s(self) -> float:
+        return max(30.0, float(self.cfg.unknown_lookup_s or 0))
 
     async def refresh_order(self, st: OrderState) -> OrderState:
         row = None
+        looked = False  # v5.3: both order lists were read successfully
         oid = self._raw_oid.get(st.client_id) or st.exchange_id
         try:
             if oid is not None:
@@ -546,12 +554,22 @@ class ArcusVenue(Venue):
                     row = next((r for r in rows if str(r.get("clientId")) == st.client_id), None)
                     if row:
                         break
+                looked = True
         except ArcusRejected as exc:
             log.debug("arcus refresh %s: %s", st.client_id, exc)
         if row:
             self._apply_order_row(row)
-        elif st.status == OrderStatus.UNKNOWN and oid is None and time.time() - st.created > 30:
-            st.apply(status=OrderStatus.REJECTED, reason="not found on exchange")
+        elif (looked and oid is None and st.status in (OrderStatus.UNKNOWN, OrderStatus.PENDING)
+              and time.time() - st.created > self._not_found_s()):
+            # v5.3: the send result was lost (e.g. connection reset) and the order is in neither list. A post-only
+            # order is treated as canceled with nothing filled, so it stays watched for late pushes / REST
+            # re-reads (late_fill_grace_s, verify_cancel_rest); the reconcile is the final backstop.
+            if st.post_only:
+                st.apply(status=OrderStatus.CANCELED, reason="not found on exchange (never reached the book)")
+                log.warning("arcus maker order %s never appeared on the exchange - treated as canceled", st.client_id)
+            else:
+                st.apply(status=OrderStatus.REJECTED, reason="not found on exchange")
+            self._notify(st.client_id)
         return st
 
     async def _refresh_open_orders(self) -> None:

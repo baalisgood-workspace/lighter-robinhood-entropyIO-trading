@@ -281,6 +281,12 @@ class Venue(ABC):
     @abstractmethod
     async def balance(self) -> Balance: ...
 
+    def unacked_resolve_s(self) -> float:
+        """v5.3: how long refresh_order may need to resolve an order whose send result was lost (UNKNOWN, no
+        exchange id): found by client id -> real state, never found -> canceled/rejected. The executor waits
+        this long (counted from order creation) before it halts on such an order."""
+        return max(0.0, float(getattr(self.cfg, "unknown_lookup_s", 0) or 0))
+
     async def wait_final(self, st: OrderState, timeout: float, poll: float = 1.0) -> OrderState:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
