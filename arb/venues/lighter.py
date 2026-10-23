@@ -128,6 +128,12 @@ class LighterVenue(Venue):
             if err is not None:
                 raise VenueError(f"{self.name}: API key check failed: {err}")
             self._tasks.append(asyncio.create_task(self._private_ws_loop(), name=f"{self.name}-private-ws"))
+            try:
+                await self.load_account_fees()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s: account fee tier not readable (%s); using the configured fees", self.name, exc)
+            self._log_fees()
+            self._start_fee_refresh()
         self.trading = trading
         self._tasks.append(asyncio.create_task(self._public_ws_loop(), name=f"{self.name}-public-ws"))
 
@@ -150,11 +156,12 @@ class LighterVenue(Venue):
             await self._session.close()
 
     # ------------------------------------------------------------ REST
-    async def _get(self, path: str, params: Optional[dict] = None, cost: float = 1.0) -> Any:
+    async def _get(self, path: str, params: Optional[dict] = None, cost: float = 1.0, headers: Optional[dict] = None) -> Any:
         await self.limiter.acquire(cost)
         assert self._session is not None
         try:
-            async with self._session.get(self.cfg.rest_url.rstrip("/") + path, params=params, allow_redirects=False) as r:
+            async with self._session.get(self.cfg.rest_url.rstrip("/") + path, params=params, allow_redirects=False,
+                                         headers=headers) as r:
                 text = await r.text()
                 if r.status != 200:
                     raise VenueError(f"{self.name} GET {path} -> HTTP {r.status}: {text[:200]}")
@@ -189,6 +196,44 @@ class LighterVenue(Venue):
                 taker_fee_pct=float(m.get("taker_fee") or 0),
                 extra={"market_id": mid, "size_decimals": size_dec, "price_decimals": price_dec},
             )
+
+    # ------------------------------------------------------------ fees (v5.4)
+    async def load_account_fees(self) -> None:
+        """Account fee tier (Standard / Premium ...) from /api/v1/accountLimits. Fee ticks are 1e-6 of notional
+        (Lighter RH Premium: maker 120 = 0.012 %, taker 350 = 0.035 %). Applied to every market of this venue."""
+        if not self.has_credentials():
+            return
+        tmp = None
+        signer = self.signer
+        if signer is None:  # read-only commands (arb fees): short-lived signer just for the auth token
+            import lighter  # lazy: native signer library
+
+            tmp = signer = lighter.SignerClient(url=self.cfg.rest_url, account_index=int(self.account_index),
+                                                api_private_keys={int(self.api_key_index): self._api_private_key},
+                                                chain_id=self.cfg.chain_id)
+        try:
+            token, err = signer.create_auth_token_with_expiry(api_key_index=int(self.api_key_index))
+            if err:
+                raise VenueError(f"auth token error: {err}")
+            d = await self._get("/api/v1/accountLimits", {"account_index": self.account_index}, headers={"authorization": token})
+        finally:
+            if tmp is not None:
+                try:
+                    await tmp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        mk, tk = d.get("current_maker_fee_tick"), d.get("current_taker_fee_tick")
+        tier = d.get("user_tier_name") or d.get("user_tier") or "?"
+        try:
+            mk, tk = int(mk), int(tk)
+        except (TypeError, ValueError):
+            raise VenueError(f"accountLimits without fee ticks: {str(d)[:200]}") from None
+        if not (-1000 <= mk <= 10000 and 0 <= tk <= 10000):  # beyond +-1 %: unit mismatch, do not trust
+            raise VenueError(f"implausible fee ticks maker={mk} taker={tk} (tier {tier})")
+        mpct, tpct = mk / 1e4, tk / 1e4
+        for m in self.markets.values():
+            m.extra.update(maker_fee_api=mpct, taker_fee_api=tpct, fee_src=f"{self.name} {tier}")
+        self._fee_note = f"account tier {tier}, ticks maker {mk} / taker {tk}"
 
     async def _account(self, max_age: float = 2.0) -> dict:
         async with self._account_lock:

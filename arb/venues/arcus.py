@@ -98,6 +98,10 @@ class ArcusVenue(Venue):
         self._write_lock = asyncio.Lock()
         self.private_connected = False
         self._watch: list[str] = []
+        self._fee_rows: dict[str, dict] = {}  # v5.4: market rows carrying the fee schedule (REST /v1/markets)
+        self._fee_level: Optional[int] = None  # account trading fee tier (None = unknown -> Base / level 0)
+        self._fee_discount_ppm = 0
+        self._fee_note = ""
 
     # ------------------------------------------------------------ identity / lifecycle
     def has_credentials(self) -> bool:
@@ -131,6 +135,13 @@ class ArcusVenue(Venue):
                 raise VenueError("arcus: missing ARCUS_ACCOUNT_ADDRESS / ARCUS_API_KEY / ARCUS_API_SIGNING_KEY")
             self._check_credentials()
         self.trading = trading
+        try:
+            await self.load_account_fees()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("arcus: account fee tier not readable (%s); using the Base tier fees", exc)
+        self._log_fees()
+        if trading:
+            self._start_fee_refresh()
         self._tasks.append(asyncio.create_task(self._ws_loop(private=trading), name="arcus-ws"))
 
     async def stop(self) -> None:
@@ -229,6 +240,66 @@ class ArcusVenue(Venue):
                        "mark": r.get("markPrice"), "bounds": (r.get("lowerTradingBound"), r.get("upperTradingBound"))})
         for r in rows:
             self._set_market(r)
+            self._keep_fee_row(r)
+        for sym in self.markets:
+            self._apply_fee(sym)
+
+    # ------------------------------------------------------------ fees (v5.4)
+    def _keep_fee_row(self, r: dict) -> None:
+        name = r.get("marketDisplayName")
+        if name and (r.get("feeTiers") or r.get("effectiveMakerFeePpm") is not None):
+            self._fee_rows[name] = r
+
+    def _apply_fee(self, sym: str) -> None:
+        """Market fee for this account: the market's tier table at the account level (stocks/RWA have their own
+        table), else the market's effective (Base) fee; positive fees reduced by the account discount."""
+        m, row = self.markets.get(sym), self._fee_rows.get(sym)
+        if m is None or row is None:
+            return
+        lvl = self._fee_level if self._fee_level is not None else 0
+        mk = tk = None
+        for t in row.get("feeTiers") or []:
+            try:
+                if int(t.get("level", -1)) == lvl:
+                    mk, tk = t.get("makerFeePpm"), t.get("takerFeePpm")
+            except (TypeError, ValueError):
+                continue
+        src = f"arcus tier {lvl}"
+        if mk is None or tk is None:
+            mk, tk, src = row.get("effectiveMakerFeePpm"), row.get("effectiveTakerFeePpm"), "arcus base"
+        try:
+            mk, tk = float(mk), float(tk)
+        except (TypeError, ValueError):
+            return
+        disc = min(max(self._fee_discount_ppm, 0), 1_000_000) / 1e6
+
+        def pct(ppm: float) -> float:
+            return round((ppm * (1 - disc) if ppm > 0 else ppm) / 1e4, 8)  # 150 ppm = 0.015 %
+
+        m.maker_fee_pct, m.taker_fee_pct = pct(mk), pct(tk)
+        m.extra.update(maker_fee_api=m.maker_fee_pct, taker_fee_api=m.taker_fee_pct,
+                       fee_src=src + (" custom" if row.get("hasCustomFeeSchedule") else ""))
+
+    async def load_account_fees(self) -> None:
+        if self.address:
+            data = await self._request("GET", "/v1/account/stats", query={"address": self.address, "include": "feeTier"})
+            t = (data or {}).get("tradingFeeTier") or {}
+            if t.get("level") is not None:
+                self._fee_level = int(t["level"])
+                self._fee_discount_ppm = int(t.get("feeDiscountPpm") or 0)
+        lvl = self._fee_level if self._fee_level is not None else 0
+        self._fee_note = (f"account tier {lvl}" + ("" if self._fee_level is not None else " (unknown, assumed Base)")
+                          + (f", discount {self._fee_discount_ppm / 1e4:g}%" if self._fee_discount_ppm else ""))
+        for sym in self.markets:
+            self._apply_fee(sym)
+
+    async def refresh_fees(self) -> None:
+        data = await self._request("GET", "/v1/markets")
+        rows = data.get("markets", data)
+        rows = list(rows.values()) if isinstance(rows, dict) else rows
+        for r in rows:
+            self._keep_fee_row(r)
+        await self.load_account_fees()
 
     # ------------------------------------------------------------ prices
     def price_tick_at(self, symbol: str, price: Decimal) -> Decimal:

@@ -57,6 +57,9 @@ class VenueConfig:
     requests_per_minute: float = 60.0
     maker_fee_pct: Optional[float] = None  # None -> use exchange-reported fee (Lighter) / required (entropy)
     taker_fee_pct: Optional[float] = None
+    # v5.4: auto = use the exchange/account-reported fee per market (configured fees are the fallback); config = old
+    fee_source: str = "auto"
+    fee_refresh_s: float = 3600.0  # re-read the account fee tier / market fee schedule this often (0 = start only)
     dex: str = "io"  # entropy only: HIP-3 dex name
     leverage: int = 3  # entropy only: isolated leverage set at start in live mode
     funding_poll_seconds: float = 60.0
@@ -329,7 +332,7 @@ DEFAULT_VENUES = {
     "entropy": dict(rest_url="https://api.hyperliquid.xyz", ws_url="wss://api.hyperliquid.xyz/ws",
                     env_prefix="ENTROPY", requests_per_minute=600.0, maker_fee_pct=0.003, taker_fee_pct=0.009),
     "arcus": dict(rest_url="https://api.arcus.xyz", ws_url="wss://api.arcus.xyz/v1/ws",
-                  env_prefix="ARCUS", requests_per_minute=120.0, maker_fee_pct=0.0, taker_fee_pct=0.0225),
+                  env_prefix="ARCUS", requests_per_minute=120.0, maker_fee_pct=0.015, taker_fee_pct=0.045),
 }
 
 DEFAULT_ROLES = {
@@ -460,6 +463,10 @@ def validate(cfg: AppConfig) -> list[str]:
             fee = getattr(v, fee_name)
             if fee is not None and not (0 <= fee < 1):
                 errs.append(f"venues.{v.name}.{fee_name} must be in [0, 1) percent")
+        if v.fee_source not in ("auto", "config"):
+            errs.append(f"venues.{v.name}.fee_source must be auto or config")
+        if v.fee_refresh_s < 0:
+            errs.append(f"venues.{v.name}.fee_refresh_s must be >= 0")
         if v.kind in ("hyperliquid", "arcus") and (v.maker_fee_pct is None or v.taker_fee_pct is None):
             errs.append(f"venues.{v.name}: maker_fee_pct/taker_fee_pct are required")
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):

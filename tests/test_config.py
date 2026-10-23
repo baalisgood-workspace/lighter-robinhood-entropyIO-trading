@@ -41,7 +41,7 @@ def test_arcus_pairs_and_roles():
     p = cfg.active_pair()
     assert p.maker == "arcus" and p.taker == "lighter"
     assert [s.key for s in cfg.symbols_for_pair(p)] == ["SNDK"]
-    assert cfg.venues["arcus"].taker_fee_pct == 0.0225
+    assert cfg.venues["arcus"].taker_fee_pct == 0.045  # v5.4: Base tier fallback (exchange fees are used)
     r["venues"] = {"entropy": {"enabled": True}, "arcus": {"enabled": True}}
     assert parse_config(r).active_pair().taker == "entropy"
     r["venues"]["lighter"] = {"enabled": True}

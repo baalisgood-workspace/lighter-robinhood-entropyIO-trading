@@ -151,6 +151,20 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.4：手续费从交易所 / 账户等级读取（不再靠手填）
+
+- **Arcus**：启动时读 `/v1/markets` 里每个市场自己的费率表（加密币 Base 挂单 0.015% / 吃单 0.045%；股票等 RWA
+  自定义表 挂单 0 / 吃单 0.0225%），再按 `/v1/account/stats?include=feeTier` 的账户等级取对应档位，正费率再扣账户
+  折扣 `feeDiscountPpm`（返佣 5% 时 0.015% → 0.01425%）。读不到账户等级时按 Base（最高档，保守）。
+- **Lighter / Lighter RH**：实盘启动时读 `/api/v1/accountLimits` 的账户等级和 `current_maker/taker_fee_tick`
+  （单位 1e-6，Premium RH = 120 / 350 = 0.012% / 0.035%），应用到该账户所有市场。数值离谱（>1%）时不采用并告警。
+- 每 `fee_refresh_s`（默认 3600 秒）重新读一次；费率变化会写日志。
+- `venues.<名>.fee_source`：`auto`（默认，用交易所/账户费率；配置里的 `maker_fee_pct/taker_fee_pct` 只在读不到时兜底）
+  或 `config`（强制用配置值，即旧行为）。Arcus 兜底默认改为 0.015 / 0.045。
+- 开仓门槛 = T1 + 网格步长 + 往返手续费，所以加密币在 Arcus 上的开仓门槛会比以前高约 0.0285%（股票不变）。
+- 新命令（只读，机器人运行时也可以跑）：`python -m arb fees --config config/xxx.yaml` 按标的列出机器人实际使用的费率和来源。
+- 启动日志会打印每个交易所的费率分组；配置值和交易所不一致时给一条 WARNING（这是预期的，说明正在用交易所的值）。
+
 ## v5.3：小于最小下单额的网格不再反复刷单 / 提交时断线不再直接停机
 
 实盘（服务器 A，PUMP）停机的根因及修复：

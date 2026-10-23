@@ -154,11 +154,79 @@ class Venue(ABC):
     def price_tick_at(self, symbol: str, price: Decimal) -> Decimal:
         return self.market(symbol).price_tick
 
+    # v5.4: fees. fee_source "auto" (default): the exchange/account-reported fee of the market wins (Arcus per-market
+    # schedule + account tier + discount, Lighter account tier); the configured maker_fee_pct/taker_fee_pct are only
+    # the fallback when the exchange did not report one. fee_source "config": configured values always win (old).
+    def _fee(self, symbol: str, side: str) -> float:
+        cfgv = getattr(self.cfg, f"{side}_fee_pct", None)
+        if getattr(self.cfg, "fee_source", "auto") == "config" and cfgv is not None:
+            return cfgv
+        m = self.market(symbol)
+        api = m.extra.get(f"{side}_fee_api")
+        if api is not None:
+            return float(api)
+        return cfgv if cfgv is not None else getattr(m, f"{side}_fee_pct")
+
     def maker_fee_pct(self, symbol: str) -> float:
-        return self.cfg.maker_fee_pct if self.cfg.maker_fee_pct is not None else self.market(symbol).maker_fee_pct
+        return self._fee(symbol, "maker")
 
     def taker_fee_pct(self, symbol: str) -> float:
-        return self.cfg.taker_fee_pct if self.cfg.taker_fee_pct is not None else self.market(symbol).taker_fee_pct
+        return self._fee(symbol, "taker")
+
+    def fee_source(self, symbol: str) -> str:
+        if getattr(self.cfg, "fee_source", "auto") == "config" and self.cfg.maker_fee_pct is not None:
+            return "config"
+        return self.market(symbol).extra.get("fee_src") or ("config" if self.cfg.maker_fee_pct is not None else "exchange")
+
+    async def load_account_fees(self) -> None:
+        """v5.4: read the account fee tier from the exchange (no-op when the venue has none)."""
+        return None
+
+    def fee_summary(self) -> str:
+        return getattr(self, "_fee_note", "") or ""
+
+    def _log_fees(self) -> None:
+        if not self.markets:
+            return
+        groups: dict = {}
+        for sym in sorted(self.markets):
+            k = (round(self.maker_fee_pct(sym), 6), round(self.taker_fee_pct(sym), 6), self.fee_source(sym))
+            groups.setdefault(k, []).append(sym)
+        parts = [f"maker {mk:.4f}% / taker {tk:.4f}% [{src}] {', '.join(v[:8])}{' ...' if len(v) > 8 else ''}"
+                 for (mk, tk, src), v in groups.items()]
+        log.info("%s fees%s: %s", self.name, f" ({self.fee_summary()})" if self.fee_summary() else "", " | ".join(parts))
+        cm, ct = self.cfg.maker_fee_pct, self.cfg.taker_fee_pct
+        if getattr(self.cfg, "fee_source", "auto") == "auto" and cm is not None:
+            off = [s for s in self.markets if self.fee_source(s) != "config"
+                   and (abs(self.maker_fee_pct(s) - cm) > 1e-9 or abs(self.taker_fee_pct(s) - (ct or 0)) > 1e-9)]
+            if off:
+                log.warning("%s: configured fees (maker %s%% / taker %s%%) differ from the exchange-reported fees of %d "
+                            "market(s); using the exchange values (set fee_source: config to force the configured ones)",
+                            self.name, cm, ct, len(off))
+
+    def _start_fee_refresh(self) -> None:
+        every = float(getattr(self.cfg, "fee_refresh_s", 3600.0) or 0)
+        if every <= 0 or getattr(self.cfg, "fee_source", "auto") == "config":
+            return
+
+        async def loop() -> None:
+            while getattr(self, "_running", True):
+                await asyncio.sleep(every)
+                try:
+                    before = {s: (self.maker_fee_pct(s), self.taker_fee_pct(s)) for s in self.markets}
+                    await self.refresh_fees()
+                    if before != {s: (self.maker_fee_pct(s), self.taker_fee_pct(s)) for s in self.markets}:
+                        log.warning("%s: fees changed", self.name)
+                        self._log_fees()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s: fee refresh failed (%s); keeping the previous fees", self.name, exc)
+
+        self._tasks.append(asyncio.create_task(loop(), name=f"{self.name}-fees"))
+
+    async def refresh_fees(self) -> None:
+        await self.load_account_fees()
 
     # ------------------------------------------------------------ orders
     def _track(self, st: OrderState) -> None:

@@ -1,4 +1,4 @@
-"""Command line entry point: check | monitor | live | positions | report."""
+"""Command line entry point: check | monitor | live | positions | fees | report."""
 from __future__ import annotations
 
 import argparse
@@ -103,6 +103,8 @@ def describe(cfg: AppConfig) -> str:
     for n in VENUE_NAMES:
         v = cfg.venues[n]
         fee = "exchange-reported" if v.maker_fee_pct is None else f"maker {v.maker_fee_pct}% / taker {v.taker_fee_pct}%"
+        if v.maker_fee_pct is not None and v.fee_source == "auto" and v.kind in ("lighter", "arcus"):
+            fee = f"exchange/account-reported (fallback {fee}; see: arb fees)"
         creds = _creds_present(cfg, n)
         lines.append(f"venue {n:<11} enabled={v.enabled!s:<5} fees: {fee}; credentials in env: {creds}")
     return "\n".join(lines)
@@ -250,6 +252,47 @@ async def _positions(cfg: AppConfig) -> int:
     return 0
 
 
+async def _fees(cfg: AppConfig) -> int:
+    """v5.4: fees the bot will use per symbol (exchange/account-reported, read-only; safe while the bot runs)."""
+    from arb.engine.signals import roundtrip_fee_pct
+    from arb.venues import build_venue
+    try:
+        pair = cfg.active_pair()
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    vs = {}
+    try:
+        for n in (pair.maker, pair.taker):
+            v = build_venue(cfg.venues[n])
+            await v.start(cfg.symbols_for_venue(n), trading=False)
+            vs[n] = v
+            if cfg.venues[n].kind == "lighter":
+                try:
+                    await v.load_account_fees()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"{n}: account fee tier not readable: {exc}")
+            c = cfg.venues[n]
+            print(f"{n}: fee_source={c.fee_source}  {v.fee_summary() or 'no account tier'}  "
+                  f"(configured fallback maker {c.maker_fee_pct}% / taker {c.taker_fee_pct}%)")
+        M, T = vs[pair.maker], vs[pair.taker]
+        print(f"\n{'symbol':<10} {pair.maker + ' maker%':>14} {pair.maker + ' taker%':>14} {pair.taker + ' taker%':>14} "
+              f"{'roundtrip%':>10}  source")
+        for s in sorted(cfg.symbols_for_pair(pair), key=lambda s: s.key):
+            ms, ts = s.venues[pair.maker], s.venues[pair.taker]
+            if ms not in M.markets or ts not in T.markets:
+                print(f"{s.key:<10} (not listed)")
+                continue
+            mk, mt, tt = M.maker_fee_pct(ms), M.taker_fee_pct(ms), T.taker_fee_pct(ts)
+            rt = roundtrip_fee_pct(mk, tt, s.execution.close_mode == "taker_taker", mt,
+                                   open_taker_taker=s.execution.open_mode == "taker_taker")
+            print(f"{s.key:<10} {mk:>14.5f} {mt:>14.5f} {tt:>14.5f} {rt:>10.4f}  {M.fee_source(ms)} / {T.fee_source(ts)}")
+        print("\nroundtrip% is added to the open threshold (open = T1 + grid step + roundtrip).")
+        return 0
+    finally:
+        await _stop_venues(vs)
+
+
 async def _accept_flat(cfg: AppConfig, confirm: bool) -> int:
     """Operator tool (ported from arcus-maker-lighter-taker operator_resolve_hedge --accept-flat): after the
     position was closed by hand, reset the local grids of a symbol to flat - only when BOTH venues show
@@ -345,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     lv.add_argument("--yes", action="store_true", help="skip interactive confirmation")
     lv.add_argument("--no-ui", action="store_true")
     common(sub.add_parser("positions", help="show exchange balances/positions and local state"))
+    common(sub.add_parser("fees", help="fees per symbol from the exchanges / account tiers (read-only)"))
     ul = common(sub.add_parser("unlock", help="clear the manual-intervention lock of a pair after you fixed it"))
     ul.add_argument("--yes", action="store_true")
     af = common(sub.add_parser("accept-flat", help="reset local grids to flat when BOTH venues are verifiably flat (manual close)"))
@@ -423,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "positions":
         return asyncio.run(_positions(cfg))
+    if args.cmd == "fees":
+        return asyncio.run(_fees(cfg))
     if args.cmd == "accept-flat":
         try:
             with _lock(instance_dir(cfg, True)):
