@@ -323,3 +323,122 @@ def print_rank(data_root: Path, mode: str, days: Optional[list[str]], pair: Opti
         path.write_text(json.dumps({"ts": _t.time(), "mode": mode, "rows": res}, indent=1))
         print(f"\nsaved {path} (used by auto_symbols.trade: ranked, top {getattr(getattr(cfg, 'auto_symbols', None), 'ranked_top_n', 15)})")
     return 0
+
+
+# ---------------------------------------------------------------------------------------------- v5.5 markouts
+def _wavg(rows: list, _key=None) -> Optional[float]:
+    num = den = 0.0
+    for w, v in rows:
+        if v is None:
+            continue
+        num += w * v
+        den += w
+    return num / den if den > 0 else None
+
+
+def markout_rows(events_path: Path, hours: Optional[float] = None, symbols: Optional[list] = None, by: str = "symbol",
+                 now: Optional[float] = None) -> tuple[list[dict], list[float]]:
+    """Aggregate `markout` journal records (one per maker fill) and the slices' hedge cost, notional-weighted.
+
+    bps from our side, positive = good for us:
+      edge0   maker fill price vs taker-venue mid at the fill (what the quote captured vs the hedge venue)
+      hedge   taker-venue average vs its mid at the fill (spread + slippage + delay of the hedge; positive = cost)
+      mM@h    maker-venue mid h seconds later vs the fill price (adverse selection on the maker venue if < 0)
+      mT@h    taker-venue mid h seconds later vs its mid at the fill (the hedge venue ran against us if < 0)
+      net@h   hedged position marked to both mids at h = mM@h - mT@h - hedge
+    """
+    import time as _t
+
+    from arb.autosym import classify
+    now = _t.time() if now is None else now
+    since = now - hours * 3600 if hours else 0.0
+    want = {s.upper() for s in symbols} if symbols else None
+    groups: dict = {}
+    hs: set = set()
+
+    def gkey(r: dict) -> str:
+        sym = str(r.get("symbol"))
+        if by == "symbol":
+            return sym
+        if by == "class":
+            return classify(sym.split("-")[0].upper())
+        if by == "session":
+            return f"{sym} {'RTH' if r.get('rth') else 'off'}"
+        if by == "kind":
+            return f"{sym} {r.get('slice') or r.get('kind')}"
+        return "all"
+
+    if not events_path.exists():
+        return [], []
+    with events_path.open() as fh:
+        for line in fh:
+            if '"markout"' not in line and '"t_mid_fill"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if float(r.get("ts") or 0) < since or (want and str(r.get("symbol", "")).upper() not in want):
+                continue
+            if r.get("kind") == "markout":
+                g = groups.setdefault(gkey(r), {"n": 0, "notional": 0.0, "edge0": [], "half": [], "mM": {}, "mT": {}, "hedge": []})
+            elif r.get("kind") in ("open", "close") and r.get("t_mid_fill") and r.get("taker_avg"):
+                g = groups.setdefault(gkey(r), {"n": 0, "notional": 0.0, "edge0": [], "half": [], "mM": {}, "mT": {}, "hedge": []})
+                s = 1.0 if str(r.get("direction", "")).startswith("buy") else -1.0
+                t0, ta = float(r["t_mid_fill"]), float(r["taker_avg"])
+                w = float(r.get("hedged") or 0) * ta
+                g["hedge"].append((w, s * (t0 - ta) / t0 * 1e4))
+                continue
+            else:
+                continue
+            w = float(r.get("qty") or 0) * float(r.get("px") or 0)
+            g["n"] += 1
+            g["notional"] += w
+            g["edge0"].append((w, r.get("edge0_bps")))
+            g["half"].append((w, r.get("half_spread_bps")))
+            for k, v in (r.get("mo_maker") or {}).items():
+                g["mM"].setdefault(float(k), []).append((w, v))
+                hs.add(float(k))
+            for k, v in (r.get("mo_taker") or {}).items():
+                g["mT"].setdefault(float(k), []).append((w, v))
+    out = []
+    for k, g in groups.items():
+        if g["n"] == 0:
+            continue
+        hedge = _wavg(g["hedge"], None)
+        row = {"key": k, "n": g["n"], "notional": g["notional"], "edge0": _wavg(g["edge0"], None),
+               "half": _wavg(g["half"], None), "hedge": hedge, "mM": {}, "mT": {}, "net": {}}
+        for h in sorted(hs):
+            mm, mt = _wavg(g["mM"].get(h, []), None), _wavg(g["mT"].get(h, []), None)
+            row["mM"][h], row["mT"][h] = mm, mt
+            row["net"][h] = None if mm is None or mt is None else mm - mt - (hedge or 0.0)
+        out.append(row)
+    out.sort(key=lambda r: -r["notional"])
+    return out, sorted(hs)
+
+
+def print_markout(events_path: Path, hours: Optional[float] = None, symbols: Optional[list] = None, by: str = "symbol") -> int:
+    rows, hs = markout_rows(events_path, hours, symbols, by)
+    if not rows:
+        print(f"no markout records in {events_path} (needs v5.5 live fills; one record ~60 s after each maker fill)")
+        return 1
+
+    def f(v, w=7):
+        return f"{'-':>{w}}" if v is None else f"{v:>{w}.2f}"
+    hdr = (f"{'group':<16}{'fills':>6}{'notional':>10}{'edge0':>7}{'hedge':>7}"
+           + "".join(f"{'mM@' + format(h, 'g'):>7}" for h in hs) + "".join(f"{'mT@' + format(h, 'g'):>7}" for h in hs)
+           + "".join(f"{'net@' + format(h, 'g'):>8}" for h in hs))
+    print(f"markouts in bps (1 bp = 0.01%), notional-weighted, from {events_path}" + (f", last {hours:g} h" if hours else ""))
+    print(hdr)
+    tot_n = tot_w = 0.0
+    for r in rows:
+        tot_n += r["n"]
+        tot_w += r["notional"]
+        print(f"{str(r['key'])[:15]:<16}{r['n']:>6}{r['notional']:>10.0f}{f(r['edge0'])}{f(r['hedge'])}"
+              + "".join(f(r["mM"][h]) for h in hs) + "".join(f(r["mT"][h]) for h in hs)
+              + "".join(f(r["net"][h], 8) for h in hs))
+    print(f"total: {int(tot_n)} fills, {tot_w:.0f} USDC maker notional")
+    print("edge0 = 成交价相对对冲所中间价的价差；hedge = 对冲成本（正数=成本）；mM/mT@h = h 秒后挂单所/对冲所中间价的变化"
+          "（正=对我们有利，负=被行情碾过）；net@h = mM - mT - hedge = 对冲后按中间价估值。net@30/60 长期为负的标的，"
+          "怎么挂都难赚纯价差。")
+    return 0

@@ -290,6 +290,8 @@ class AppConfig:
     data_dir: str = "data"
     log_dir: str = "logs"
     sampler_interval_s: float = 5.0
+    # v5.5: after every maker fill, record both venues' mids at these delays (markout / adverse-selection stats)
+    markout_horizons_s: list = field(default_factory=lambda: [1.0, 5.0, 30.0, 60.0])
     max_parallel_slices: int = 1  # concurrent maker slices (different symbols) per instance
     ui_refresh_s: float = 1.0
     guards: GuardsConfig = field(default_factory=GuardsConfig)
@@ -376,7 +378,7 @@ def parse_venues(raw: dict) -> dict[str, VenueConfig]:
 
 def parse_config(raw: dict) -> AppConfig:
     raw = copy.deepcopy(raw)
-    allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s",
+    allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s", "markout_horizons_s",
                    "ui_refresh_s", "guards", "auto_symbols", "ui"}
     if raw.get("symbols") == "auto":  # only auto symbols (expanded by arb/autosym.py before parsing)
         raw["symbols"] = {}
@@ -441,6 +443,7 @@ def parse_config(raw: dict) -> AppConfig:
         data_dir=str(paths.get("data_dir", "data")),
         log_dir=str(paths.get("log_dir", "logs")),
         sampler_interval_s=float(raw.get("sampler_interval_s", 5.0)),
+        markout_horizons_s=sorted(float(x) for x in (raw.get("markout_horizons_s", [1, 5, 30, 60]) or [])),
         ui_refresh_s=float(raw.get("ui_refresh_s", 1.0)),
         guards=_build(GuardsConfig, raw.get("guards") or {}, "guards"),
         auto_symbols=_build(AutoSymbolsConfig, raw.get("auto_symbols") or {}, "auto_symbols"),
@@ -471,6 +474,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"venues.{v.name}: maker_fee_pct/taker_fee_pct are required")
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):
             errs.append(f"venues.{v.name}.leverage must be 1..50")
+    if any(h <= 0 or h > 600 for h in cfg.markout_horizons_s):
+        errs.append("markout_horizons_s: delays must be in (0, 600] seconds")
     g = cfg.guards
     if g.slippage_pause_scope not in ("all", "symbol"):
         errs.append("guards.slippage_pause_scope must be all or symbol")

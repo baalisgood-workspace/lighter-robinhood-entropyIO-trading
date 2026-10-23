@@ -117,6 +117,9 @@ class Engine:
         self.inflight: dict[str, ExecPlan] = {}
         self.reconcile_due = False  # barrier: no new slices until the running ones finished and we reconciled
         self.executor = Executor(venues, stop_flag=lambda: self.stopping or bool(self.halted))
+        self._markout_tasks: set[asyncio.Task] = set()
+        if live:
+            self.executor.on_fill = self._on_fill
         self.started = time.time()
         self.lock_path = data / "MANUAL_INTERVENTION.json"
         self.journal_path = data / "events.jsonl"
@@ -472,6 +475,7 @@ class Engine:
 
     async def shutdown(self) -> None:
         self.stopping = True
+        await self._drain_markouts()
         running = [t for t in self.exec_tasks.values() if not t.done()]
         if running:
             self.event(f"waiting for {len(running)} in-flight execution(s) to finish ...")
@@ -982,6 +986,66 @@ class Engine:
         self.apply_result(c, plan, res)
         c.cooldown_until = time.time() + c.sym.execution.cooldown_s
 
+    # ------------------------------------------------------------ v5.5 markouts
+    @staticmethod
+    def _fill_mids(res: ExecResult) -> dict:
+        """Qty-weighted mids of both venues at the moments the maker fills were seen (hedge cost = taker avg vs
+        taker mid at fill)."""
+        fs = [f for f in res.fills if f.get("t_mid") and f.get("m_mid")]
+        q = sum(f["qty"] for f in fs)
+        if not fs or q <= 0:
+            return {}
+        return {"fills_n": len(res.fills), "m_mid_fill": sum(f["m_mid"] * f["qty"] for f in fs) / q,
+                "t_mid_fill": sum(f["t_mid"] * f["qty"] for f in fs) / q,
+                "fill_ts": round(fs[0]["t"], 3)}
+
+    def _on_fill(self, plan: ExecPlan, fill: dict) -> None:
+        hs = [h for h in (self.cfg.markout_horizons_s or []) if h > 0]
+        if not hs or not fill.get("px"):
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._markout(plan, dict(fill), hs))
+        except RuntimeError:
+            return
+        self._markout_tasks.add(task)
+        task.add_done_callback(self._markout_tasks.discard)
+
+    async def _markout(self, plan: ExecPlan, f: dict, hs: list[float]) -> None:
+        """Mids of both venues h seconds after a maker fill, in bps from our side (positive = price moved in our
+        favour): maker = s * (maker mid(t+h) - fill price), taker = s * (taker mid(t+h) - taker mid(t))."""
+        M, T = self.venues[plan.pair.maker], self.venues[plan.pair.taker]
+        s = 1.0 if sg.maker_is_buy(plan.direction) else -1.0
+        px, m0, t0 = f["px"], f.get("m_mid"), f.get("t_mid")
+        mo_m, mo_t, stale = {}, {}, []
+        try:
+            for h in hs:
+                delay = f["t"] + h - time.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                key = f"{h:g}"
+                mb, tb = M.book(plan.maker_sym), T.book(plan.taker_sym)
+                if M.quote_age(plan.maker_sym) > 5 or T.quote_age(plan.taker_sym) > 5:
+                    stale.append(key)
+                if mb and mb.mid:
+                    mo_m[key] = round(s * (float(mb.mid) - px) / px * 1e4, 3)
+                if tb and tb.mid and t0:
+                    mo_t[key] = round(s * (float(tb.mid) - t0) / t0 * 1e4, 3)
+        except asyncio.CancelledError:
+            pass  # shutdown: keep what was sampled
+        from arb.config import us_regular_hours
+        self.journal("markout", symbol=plan.sym.key, slice=plan.kind, direction=plan.direction, level=plan.level,
+                     fill_ts=round(f["t"], 3), qty=f["qty"], px=px, m_mid0=m0, t_mid0=t0,
+                     edge0_bps=round(s * (t0 - px) / px * 1e4, 3) if t0 else None,
+                     half_spread_bps=round(s * (m0 - px) / px * 1e4, 3) if m0 else None,
+                     mo_maker=mo_m, mo_taker=mo_t, stale=stale or None, rth=bool(us_regular_hours(f["t"])),
+                     category=plan.sym.category or ("us_equity" if plan.sym.strategy.session == "us_equity" else ""))
+
+    async def _drain_markouts(self) -> None:
+        for t in list(self._markout_tasks):
+            t.cancel()
+        if self._markout_tasks:
+            await asyncio.gather(*self._markout_tasks, return_exceptions=True)
+
     def apply_result(self, c: Ctx, plan: ExecPlan, res: ExecResult) -> None:
         sp = self.position(c)
         s_m = Decimal(1) if sg.maker_is_buy(plan.direction) else Decimal(-1)
@@ -1024,7 +1088,8 @@ class Engine:
                      requotes=res.requotes, hedge_orders=res.hedge_orders, zero_fill_hedges=res.zero_fill_hedges,
                      unwound=res.maker_unwound, error=res.error or None, slippage=slip,
                      hedge_latency_s=round(max(res.hedge_latencies), 3) if res.hedge_latencies else None,
-                     residual_maker=sp.residual_maker, residual_taker=sp.residual_taker)
+                     residual_maker=sp.residual_maker, residual_taker=sp.residual_taker,
+                     **self._fill_mids(res))
         msg = (f"{plan.kind} {c.sym.key}: maker {res.maker_filled}@{_f(res.maker_avg)} taker {res.taker_filled}@{_f(res.taker_avg)}"
                f" hedged={hedged} edge={_f(dev)}% {res.note}")
         if res.maker_unwound:

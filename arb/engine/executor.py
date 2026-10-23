@@ -83,6 +83,8 @@ class ExecResult:
     requotes: int = 0
     events: list[str] = field(default_factory=list)
     hedge_latencies: list[float] = field(default_factory=list)  # taker IOC submit -> final, seconds
+    # v5.5: every maker fill increment as seen: wall time, qty, price, both venues' mids at that moment
+    fills: list[dict] = field(default_factory=list)
 
     @property
     def maker_avg(self) -> Optional[Decimal]:
@@ -110,6 +112,7 @@ class Executor:
     def __init__(self, venues: dict[str, Venue], stop_flag: Callable[[], bool] = lambda: False):
         self.venues = venues
         self.stop_flag = stop_flag
+        self.on_fill: Optional[Callable[[ExecPlan, dict], None]] = None  # v5.5: markout sampler hook
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -334,6 +337,16 @@ class Executor:
                 pending += inc
                 res.maker_filled += inc
                 res.maker_cost += cost_now - seen_cost
+                if len(res.fills) < 50:
+                    try:
+                        mbk, tbk = M.book(plan.maker_sym), T.book(plan.taker_sym)
+                        res.fills.append({"t": time.time(), "qty": float(inc), "px": float((cost_now - seen_cost) / inc),
+                                          "m_mid": float(mbk.mid) if mbk and mbk.mid else None,
+                                          "t_mid": float(tbk.mid) if tbk and tbk.mid else None})
+                        if self.on_fill is not None:
+                            self.on_fill(plan, res.fills[-1])
+                    except Exception:  # noqa: BLE001 - statistics only
+                        pass
                 seen_cost = cost_now
 
         async def finalize(o: OrderState) -> None:

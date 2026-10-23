@@ -1,4 +1,4 @@
-"""Command line entry point: check | monitor | live | positions | fees | report."""
+"""Command line entry point: check | monitor | live | positions | fees | markout | report."""
 from __future__ import annotations
 
 import argparse
@@ -389,6 +389,11 @@ def main(argv: list[str] | None = None) -> int:
     lv.add_argument("--no-ui", action="store_true")
     common(sub.add_parser("positions", help="show exchange balances/positions and local state"))
     common(sub.add_parser("fees", help="fees per symbol from the exchanges / account tiers (read-only)"))
+    mo = common(sub.add_parser("markout", help="price moves after maker fills (adverse selection), from the live journal"))
+    mo.add_argument("--hours", type=float, default=None, help="only the last N hours")
+    mo.add_argument("--symbols", help="comma list")
+    mo.add_argument("--by", choices=("symbol", "class", "session", "kind", "all"), default="symbol",
+                    help="group by symbol | class (stock/crypto) | session (US regular hours or not) | kind (open/close)")
     ul = common(sub.add_parser("unlock", help="clear the manual-intervention lock of a pair after you fixed it"))
     ul.add_argument("--yes", action="store_true")
     af = common(sub.add_parser("accept-flat", help="reset local grids to flat when BOTH venues are verifiably flat (manual close)"))
@@ -439,6 +444,14 @@ def main(argv: list[str] | None = None) -> int:
         mode = args.mode or (next(iter(cfg.symbols.values())).execution.open_mode if cfg.symbols else "maker_taker")
         return print_rank(Path(cfg.data_dir), mode, args.days.split(",") if args.days else None, args.pair, args.top,
                           args.save, cfg)
+    if args.cmd == "markout":
+        from arb.report import print_markout
+        try:
+            path = instance_dir(cfg, True) / "events.jsonl"
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return 2
+        return print_markout(path, args.hours, args.symbols.split(",") if args.symbols else None, args.by)
     if args.cmd == "markets":
         from arb.markets import fetch_all, render
         listing = asyncio.run(fetch_all(cfg))

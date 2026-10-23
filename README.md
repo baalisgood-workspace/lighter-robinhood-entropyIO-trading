@@ -151,6 +151,28 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.5：成交后价格走势统计（markout）
+
+用来回答"挂单成交后价格往哪边走、对冲后到底赚不赚价差"，为以后决定要不要常驻挂单、哪些标的值得做提供数据。不改变任何下单逻辑。
+
+- 每次 maker 成交（开仓、平仓分片都算）后，在 `markout_horizons_s`（默认 `[1, 5, 30, 60]` 秒，范围 0~600）各取一次两边中间价，
+  写入 `events.jsonl`（kind=`markout`）：成交价、成交时两边中间价、成交时价差 `edge0_bps`、半个盘口价差、
+  `mo_maker{h}` / `mo_taker{h}`（单位 bps，**正数 = 对我们有利**）、是否美股常规交易时段、标的类别。
+- open/close 记录里多了 `fills_n / m_mid_fill / t_mid_fill / fill_ts`，用来计算对冲成本（taker 实际成交价相对成交时 taker 中间价的滑点）。
+- 新命令（只读，运行中也能跑）：
+
+```bash
+python -m arb markout --config config/xxx.yaml                 # 全部，按标的汇总
+python -m arb markout --config config/xxx.yaml --by class      # 按 股票/加密币
+python -m arb markout --config config/xxx.yaml --by session --hours 24   # 按 美股盘中/盘外，最近 24 小时
+python -m arb markout --config config/xxx.yaml --symbols META,PLTR --by kind  # 开仓/平仓分开
+```
+
+- 输出按成交名义金额加权：`maker@h`（maker 那边中间价在 h 秒后相对成交价的走势）、`taker@h`、`hedge`（对冲滑点）、
+  `net@h = maker@h − taker@h − hedge`（不含手续费）。`net@30 / net@60` 长期为负，说明这个标的上被动成交基本是被"挑单"，
+  任何挂单模式都赚不到纯价差；为正且稳定的标的才值得考虑 `maker_price_mode: threshold` 之类的常驻挂单。
+- 采样时任一边行情超过 5 秒没更新，会在该条记录的 `stale` 里标出对应周期（仍计入统计，用于排查断流）。
+
 ## v5.4：手续费从交易所 / 账户等级读取（不再靠手填）
 
 - **Arcus**：启动时读 `/v1/markets` 里每个市场自己的费率表（加密币 Base 挂单 0.015% / 吃单 0.045%；股票等 RWA
