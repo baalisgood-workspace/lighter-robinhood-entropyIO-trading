@@ -1,4 +1,4 @@
-"""Command line entry point: check | monitor | live | positions | fees | markout | report."""
+"""Command line entry point: check | monitor | live | positions | fees | markout | tune | report."""
 from __future__ import annotations
 
 import argparse
@@ -394,6 +394,11 @@ def main(argv: list[str] | None = None) -> int:
     mo.add_argument("--symbols", help="comma list")
     mo.add_argument("--by", choices=("symbol", "class", "session", "kind", "all"), default="symbol",
                     help="group by symbol | class (stock/crypto) | session (US regular hours or not) | kind (open/close)")
+    tu = common(sub.add_parser("tune", help="threshold advice per symbol from the live journal (advise only, changes nothing)"))
+    tu.add_argument("--hours", type=float, default=None, help="look back N hours (default: autotune.lookback_h)")
+    tu.add_argument("--symbols", help="comma list")
+    tu.add_argument("--all", action="store_true", help="also list symbols without closes in the window")
+    tu.add_argument("--log", action="store_true", help="show the advice the running bot journaled (tune_advice)")
     ul = common(sub.add_parser("unlock", help="clear the manual-intervention lock of a pair after you fixed it"))
     ul.add_argument("--yes", action="store_true")
     af = common(sub.add_parser("accept-flat", help="reset local grids to flat when BOTH venues are verifiably flat (manual close)"))
@@ -452,6 +457,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"config error: {exc}", file=sys.stderr)
             return 2
         return print_markout(path, args.hours, args.symbols.split(",") if args.symbols else None, args.by)
+    if args.cmd == "tune":
+        from arb.tune import print_tune, print_tune_log
+        try:
+            path = instance_dir(cfg, True) / "events.jsonl"
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return 2
+        syms = args.symbols.split(",") if args.symbols else None
+        if args.log:
+            return print_tune_log(path, args.hours or 24.0, syms)
+        return print_tune(cfg, path, args.hours, syms, args.all)
     if args.cmd == "markets":
         from arb.markets import fetch_all, render
         listing = asyncio.run(fetch_all(cfg))

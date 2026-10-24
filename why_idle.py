@@ -32,7 +32,7 @@ for d in dirs:
     ev = os.path.join(d, "events.jsonl")
     if os.path.exists(ev):
         last, kinds, n_in = {}, Counter(), Counter()
-        skips, dusts = Counter(), []
+        skips, dusts, tunes = Counter(), [], None
         with open(ev) as fh:
             for line in fh:
                 try:
@@ -47,13 +47,24 @@ for d in dirs:
                         skips[(e.get("symbol"), e.get("reason"), (e.get("detail") or "")[:60])] += 1
                     elif k == "dust_flatten":
                         dusts.append((t, e))
+                    elif k == "tune_advice":  # v5.6.1
+                        tunes = (t, e)
         print(f"events.jsonl 窗口内各类记录数:", dict(n_in) or "无")
         if skips:
             print("  v5.6 没成交的开仓信号（每个标的每种原因最多 5 分钟记一次）：")
             for (sym, why, det), n in skips.most_common(25):
                 print(f"    {sym:<10} {why:<24} {n:>4} 次  {det}")
         for t, e in dusts:
-            print(f"  残仓清理 {ts(t)} {e.get('symbol')}: {'成功' if e.get('ok') else '未完成'}  前 {e.get('before')} 后 {e.get('after')}  {e.get('error') or ''}")
+            kind = "残仓(无网格)" if e.get("mode") == "residual" else "残仓"
+            src = {"exchange": "交易所已确认", "computed": "按成交计算，交易所数据未跟上"}.get(e.get("source"), "")
+            print(f"  {kind}清理 {ts(t)} {e.get('symbol')}: {'成功' if e.get('ok') else '未完成'}  前 {e.get('before')} 后 {e.get('after')}  {src}  {e.get('error') or ''}")
+        if tunes:  # v5.6.1: latest threshold advice (advise only)
+            t, e = tunes
+            sug = [r for r in e.get("rows") or [] if r.get("action") != "hold"]
+            print(f"  门槛建议（只建议不修改，{ts(t)}）：" + ("无调整建议" if not sug else ""))
+            for r in sug:
+                tgt = f" -> {r.get('target')}" if r.get("target") is not None else ""
+                print(f"    {r.get('symbol'):<10} {r.get('bucket'):<4} T1 {r.get('t1')}{tgt}  {r.get('action')}: {r.get('why')}")
         for k in ("open", "close"):
             if k in last:
                 t, e = last[k]

@@ -26,6 +26,10 @@ class Grid:
     lots: list = field(default_factory=list)
     maker_cost: float = 0.0  # qty * avg opening price (dashboard entry prices)
     taker_cost: float = 0.0
+    # v5.6.1: T1 (initial threshold %) and session bucket (all | rth | off) in effect when this grid was first
+    # opened - the threshold auto-tune advisor attributes the PnL of its closes to that threshold
+    t1: Optional[float] = None
+    bucket: Optional[str] = None
 
     @property
     def maker_entry(self) -> Optional[float]:
@@ -106,7 +110,8 @@ class SymbolPosition:
     # -------------------------------------------------------------- mutations
     def add_open(self, direction: str, level: int, hedged: Decimal, target: Decimal, dev: float,
                  raw: Optional[float] = None, ts: Optional[float] = None,
-                 maker_px: Optional[float] = None, taker_px: Optional[float] = None) -> None:
+                 maker_px: Optional[float] = None, taker_px: Optional[float] = None,
+                 t1: Optional[float] = None, bucket: Optional[str] = None) -> None:
         if hedged <= 0:
             return
         if self.direction is None or not self.grids:  # v5.6: residual dust without grids does not lock a direction
@@ -114,8 +119,10 @@ class SymbolPosition:
         assert self.direction == direction, "cannot add opposite direction"
         g = self.grids[-1] if self.grids and self.grids[-1].level == level else None
         if g is None:
-            g = Grid(level=level, qty=ZERO, target_qty=target)
+            g = Grid(level=level, qty=ZERO, target_qty=target, t1=t1, bucket=bucket)
             self.grids.append(g)
+        elif g.t1 is None:
+            g.t1, g.bucket = t1, bucket
         g.qty += hedged
         g.open_dev_sum += dev * float(hedged)
         g.lots.append([hedged, raw, ts if ts is not None else time.time()])
@@ -174,7 +181,8 @@ class SymbolPosition:
             sp.grids.append(Grid(level=int(g["level"]), qty=Decimal(g["qty"]), target_qty=Decimal(g["target_qty"]),
                                  open_dev_sum=float(g.get("open_dev_sum", 0.0)), opened_ts=float(g.get("opened_ts", time.time())),
                                  lots=[[Decimal(q), (None if r is None else float(r)), float(t)] for q, r, t in g.get("lots", [])],
-                                 maker_cost=float(g.get("maker_cost", 0.0)), taker_cost=float(g.get("taker_cost", 0.0))))
+                                 maker_cost=float(g.get("maker_cost", 0.0)), taker_cost=float(g.get("taker_cost", 0.0)),
+                                 t1=(None if g.get("t1") is None else float(g["t1"])), bucket=g.get("bucket")))
         if sp.direction not in (None, SHORT_MAKER, LONG_MAKER):
             raise ValueError(f"bad direction in state: {sp.direction}")
         return sp

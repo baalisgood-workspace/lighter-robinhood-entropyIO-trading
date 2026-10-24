@@ -151,6 +151,62 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.6.1：清理结果以成交为准 / 只剩一边的小残仓也清理 / 门槛调整建议（只建议，不改参数）
+
+**1. 小残仓清理后的持仓以成交结果为准**：v5.6 平完残仓后立刻查交易所持仓，查到的有时还是旧数据
+（ANTHROPIC 那次实际已经平了，本地却记成 Lighter 还有 0.00378）。现在按「清理前持仓 + 每笔清理订单的成交量」算出清理后持仓，
+再每 1.5 秒查一次交易所，最多 4 次，直到两边一致（`dust_flatten` 记录里 `source: exchange`）；交易所一直没跟上就按成交结果记
+（`source: computed`，并记下看到的交易所数字 `exchange_seen`），之后的定时对账会再核对一次。
+没平干净时的提示改成说明真实情况：剩下的记为残仓，由下面第 2 条的残仓清理接着处理（约 30 分钟后）。
+
+**2. 只剩一边的小残仓（没有网格）也自动清理（`risk.dust_residual_grace_s`，默认 1800 秒）**：例如 `grids=[] residual maker=-0.004`
+（VVV 那种），低于交易所最小下单额，正常的残仓处理永远下不了单。满足以下条件就用 v5.6 同样的办法（同方向补到最小额，再 reduce-only 全平）清掉：
+- 本地残仓和交易所该边的实际持仓一致（不一致先交给对账处理）；
+- 连续 `dust_residual_grace_s` 没变化（期间如果有同方向的新分片，挂单那边的零头会照旧跟着一起对冲掉）；
+- 每边不超过 `dust_max_usdc`（默认 25 USDC）；`risk.dust_flatten: false` 时同样关闭。
+- 记录同样是 `dust_flatten`，多一个 `mode: residual`。
+
+**3. 盘口太薄时加大滑点再试一次**：清理时补单或平仓没有全部成交，会用 2 倍 `hedge_slippage_pct` 再试一次（记录里有 `slippage_pct`）。
+
+**4. 门槛调整建议（`autotune`，默认开，只写日志，不改任何参数）**：机器人每小时（`interval_s`）按最近 7 天（`lookback_h`）的平仓记录，
+逐个标的评估一次，结果写进 `events.jsonl`（kind=`tune_advice`）；建议有变化时在事件日志打一行 `tune advice ...`。
+- 每笔平仓算「毛利 bps − 往返手续费 bps」，按名义金额加权求平均和置信区间（`z` = 1.645，约 95% 单边）。
+- 只看**当前门槛**下开出来的仓位：开仓时把当时的 T1 记在网格上（`open/close` 记录新增 `t1 / bucket / open_t1 / open_bucket / fee_pct`）；
+  v5.6.1 之前的旧记录按平仓触发价和当前的 `grid_step_pct / first_close_ratio` 反推 T1。美股（设了 `offhours_threshold_pct`）盘中、盘外分开算。
+- 规则：当前门槛下平仓少于 `min_closes`（30）笔 → 不动（若更低门槛的历史数据显著赚钱，建议降一档）；置信下限 > `lower_bps`（1 bps）→ 建议降 `step_pct`（0.01%）；
+  置信上限 < `raise_bps`（0）→ 建议升一档；已到上限还在亏 → 建议 `close_only`（事件日志 WARNING）；其他 → 不动。
+- 每个标的的门槛上下限（`autotune.bounds`，先按标的、再按类别；没配的用 T1 的 0.5~2 倍）。内置默认值根据 B 服务器 10-23/10-24 的成交数据定：
+
+| 标的 / 类别 | 下限 | 上限 | 盘外下限 | 盘外上限 |
+|---|---|---|---|---|
+| crypto（加密币） | 0.08 | 0.25 | | |
+| us_equity（美股） | 0.08 | 0.30 | 0.12 | 0.40 |
+| other（其他） | 0.06 | 0.30 | | |
+| ANTHROPIC | 0.06 | 0.20 | | |
+| OPENAI | 0.10 | 0.25 | | |
+| MU | 0.10 | 0.25 | 0.20 | 0.40 |
+
+  想改就在配置里加（只写要改的项）：
+
+```yaml
+autotune:
+  enabled: true        # false = 不评估
+  min_closes: 30
+  bounds:
+    LIT: {min: 0.10, max: 0.30}
+    us_equity: {offhours_max: 0.50}
+```
+
+- 查看（只读，运行中也能跑）：
+
+```bash
+python -m arb tune --config config/xxx.yaml              # 现在按日志算一遍：每个标的当前门槛、笔数、净 bps、置信区间、建议、各门槛的历史
+python -m arb tune --config config/xxx.yaml --hours 48 --symbols ANTHROPIC,OPENAI
+python -m arb tune --config config/xxx.yaml --log         # 机器人每小时写下的建议（只列变化），默认最近 24 小时
+```
+
+`why_idle.py` 也会显示最新一次的调整建议和残仓清理的确认来源。第二阶段（自动按建议调整，每天最多 2 次）等建议跑 1~2 周、核对过准确度后再做。
+
 ## v5.6：卡死的小残仓自动清理 / 残仓不再锁方向 / 没成交的信号写日志
 
 **1. 小残仓自动清理（`risk.dust_flatten`，默认开）**：某个网格因为低于交易所最小下单额而平不掉
@@ -181,7 +237,7 @@ Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10
 
 - 每次 maker 成交（开仓、平仓分片都算）后，在 `markout_horizons_s`（默认 `[1, 5, 30, 60]` 秒，范围 0~600）各取一次两边中间价，
   写入 `events.jsonl`（kind=`markout`）：成交价、成交时两边中间价、成交时价差 `edge0_bps`、半个盘口价差、
-  `mo_maker{h}` / `mo_taker{h}`（单位 bps，**正数 = 对我们有利**）、是否美股常规交易时段、标的类别。
+  `mo_maker{h}` / `mo_taker{h}`（单位 bps，按挂单方向计：mo_maker 正 = 对挂单腿有利；mo_taker 正 = 对冲所价格也朝挂单方向走，对对冲腿不利）、是否美股常规交易时段、标的类别。
 - open/close 记录里多了 `fills_n / m_mid_fill / t_mid_fill / fill_ts`，用来计算对冲成本（taker 实际成交价相对成交时 taker 中间价的滑点）。
 - 新命令（只读，运行中也能跑）：
 

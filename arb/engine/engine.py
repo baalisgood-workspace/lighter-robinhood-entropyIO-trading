@@ -13,7 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-from arb.config import AppConfig, ConfigError, Pair, SymbolConfig, effective_t1
+from arb.config import AppConfig, ConfigError, Pair, SymbolConfig, effective_t1, tune_bucket
 from arb.engine import signals as sg
 from arb.engine.basis import BasisBook, BasisState
 from arb.engine.claims import Claims
@@ -89,6 +89,8 @@ class Ctx:
     dust_next: float = 0.0  # v5.6: no dust clean-up attempt before this time (after a failed / refused one)
     dust_note: str = ""  # v5.6: last "too large for clean-up" warning (warned once per change)
     skip_logged: dict = field(default_factory=dict)  # v5.6: reason -> last time a skipped signal was logged
+    resid_seen: tuple = ()  # v5.6.1: (maker, taker) residual without grids at the last check ...
+    resid_since: Optional[float] = None  # ... unchanged since then (residual dust clean-up grace)
 
     @property
     def key(self) -> str:
@@ -123,6 +125,9 @@ class Engine:
         self.reconcile_due = False  # barrier: no new slices until the running ones finished and we reconciled
         self.executor = Executor(venues, stop_flag=lambda: self.stopping or bool(self.halted))
         self._markout_tasks: set[asyncio.Task] = set()
+        self.settle_delay_s = 1.5  # v5.6.1: wait between position polls after a dust clean-up (exchange catches up)
+        self.settle_attempts = 4
+        self._tune_last: dict = {}  # v5.6.1: (symbol, bucket) -> last advice text (logged only when it changes)
         if live:
             self.executor.on_fill = self._on_fill
         self.started = time.time()
@@ -472,6 +477,8 @@ class Engine:
                  asyncio.create_task(self._persist_loop(), name="persist"),
                  asyncio.create_task(self._sampler_loop(), name="sampler"),
                  asyncio.create_task(self._account_loop(), name="account")]
+        if self.live and self.cfg.autotune.enabled:
+            tasks.append(asyncio.create_task(self._tune_loop(), name="tune"))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -1115,11 +1122,17 @@ class Engine:
         raw = (sg.raw_edge(plan.direction, res.maker_avg, res.taker_avg)
                if res.maker_avg is not None and res.taker_avg is not None else None)
         pnl = None
+        now_ts = time.time()
+        t1_now, bucket_now = effective_t1(c.sym.strategy, now_ts), tune_bucket(c.sym.strategy, now_ts)
+        open_t1 = open_bucket = None  # v5.6.1: threshold attribution of the grid this close reduces
+        if plan.kind != "open" and sp.grids:
+            open_t1, open_bucket = sp.grids[-1].t1, sp.grids[-1].bucket
         if plan.kind == "open":
             if hedged > 0:
                 sp.add_open(sg.POSITION_OF[plan.direction], plan.level, hedged, plan.target or hedged, dev or 0.0, raw=raw,
                             maker_px=float(res.maker_avg) if res.maker_avg else None,
-                            taker_px=float(res.taker_avg) if res.taker_avg else None)
+                            taker_px=float(res.taker_avg) if res.taker_avg else None,
+                            t1=t1_now, bucket=bucket_now)
         else:
             if hedged > 0 and sp.grids:
                 g = sp.grids[-1]
@@ -1147,6 +1160,8 @@ class Engine:
                      unwound=res.maker_unwound, error=res.error or None, slippage=slip,
                      hedge_latency_s=round(max(res.hedge_latencies), 3) if res.hedge_latencies else None,
                      residual_maker=sp.residual_maker, residual_taker=sp.residual_taker,
+                     t1=t1_now, bucket=bucket_now, open_t1=open_t1, open_bucket=open_bucket,
+                     fee_pct=round(self._fees(c), 6),
                      **self._fill_mids(res))
         msg = (f"{plan.kind} {c.sym.key}: maker {res.maker_filled}@{_f(res.maker_avg)} taker {res.taker_filled}@{_f(res.taker_avg)}"
                f" hedged={hedged} edge={_f(dev)}% {res.note}")
@@ -1210,6 +1225,9 @@ class Engine:
                 if self.halted:
                     return
                 continue
+            await self._residual_dust(c, sp)  # v5.6.1: residual-only dust the normal path below can never trade
+            if self.halted:
+                return
             for vname, sym, attr in ((c.pair.maker, c.maker_sym, "residual_maker"), (c.pair.taker, c.taker_sym, "residual_taker")):
                 r = getattr(sp, attr)
                 if r == 0:
@@ -1240,8 +1258,9 @@ class Engine:
         """v5.6: a grid that has been unclosable for risk.dust_grace_s (below an exchange minimum on a leg, or a
         close hedge that can never be sent) and whose legs are each worth <= risk.dust_max_usdc is flattened on
         both venues with taker orders: a leg below the venue minimum is first topped up to the minimum (same
-        side), then closed completely with a reduce-only order. Afterwards the local state is set to the
-        exchange positions. Returns True when this symbol was handled here."""
+        side), then closed completely with a reduce-only order. v5.6.1: the result is computed from the order
+        fills (position before + fills) and confirmed by polling the exchange positions until they agree; a
+        position read right after the fills can be stale. Returns True when this symbol was handled here."""
         rk = c.sym.risk
         now = time.time()
         if not (rk.dust_flatten and sp.grids and c.unclosable and c.unclosable_since is not None):
@@ -1280,39 +1299,135 @@ class Engine:
                 self.journal("dust_flatten", symbol=c.sym.key, ok=False, reason=why, before=before, orders=orders,
                              local_before=local_before, error="unknown order outcome (halted)")
                 return True
-        M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
-        try:
-            pm, pt = await M.positions(), await T.positions()
-        except Exception as exc:  # noqa: BLE001 - the next reconcile finds out; no new attempt for a while
-            c.dust_next = now + max(600.0, rk.failure_pause_s)
-            self.journal("dust_flatten", symbol=c.sym.key, ok=False, reason=why, before=before, orders=orders,
-                         local_before=local_before, error=f"positions: {exc}")
-            self.reconcile_due = True
-            log.warning("dust clean-up %s: positions failed: %s", c.sym.key, exc)
-            return True
-        self.exch_positions[M.name], self.exch_positions[T.name] = pm, pt
-        am = pm.get(c.maker_sym).qty if c.maker_sym in pm else ZERO
-        at = pt.get(c.taker_sym).qty if c.taker_sym in pt else ZERO
-        # local state := what the exchanges hold now (no grid; anything left is residual, settled as usual)
+        expect = {vname: (sym, q + _signed_fills(orders, vname)) for vname, _v, sym, q, _x in legs}
+        got, source, seen = await self._settle_positions(expect)
+        am, at = got[c.pair.maker], got[c.pair.taker]
+        # local state := the positions after the clean-up (no grid; anything left is residual)
         sp.grids.clear()
         sp.direction = None
         sp.residual_maker, sp.residual_taker = am, at
         sp.updated = time.time()
         self.positions.save()
         c.unclosable, c.unclosable_since, c.dust_note = "", None, ""
+        c.resid_seen, c.resid_since = (am, at), time.time()
         ok = am == 0 and at == 0
-        self.journal("dust_flatten", symbol=c.sym.key, ok=ok, reason=why, before=before, orders=orders,
-                     local_before=local_before, after={M.name: str(am), T.name: str(at)})
+        M, T = c.pair.maker, c.pair.taker
+        self.journal("dust_flatten", symbol=c.sym.key, mode="grid", ok=ok, reason=why, before=before, orders=orders,
+                     local_before=local_before, after={M: _dn(am), T: _dn(at)}, source=source,
+                     exchange_seen=seen or None)
         if ok:
             self.event(f"{c.sym.key}: dust clean-up done, both venues flat ({len(orders)} order(s))")
         else:
+            wait = max(600.0, rk.failure_pause_s, rk.dust_residual_grace_s)
             c.dust_next = now + max(600.0, rk.failure_pause_s)
-            self.event(f"WARNING {c.sym.key}: dust clean-up incomplete: {M.name} {am}, {T.name} {at} "
-                       f"(kept as residual; next attempt in {max(600.0, rk.failure_pause_s):.0f}s)", logging.WARNING)
+            self.event(f"WARNING {c.sym.key}: dust clean-up incomplete: {M} {am}, {T} {at} - kept as residual; "
+                       f"the residual clean-up retries in about {wait / 60:.0f} min", logging.WARNING)
         return True
+
+    async def _residual_dust(self, c: Ctx, sp: SymbolPosition) -> None:
+        """v5.6.1: residual-only dust (no grid) on a leg that the normal residual settlement can never trade
+        (below the venue minimum, or maker dust below hedge_min_notional_usdc waiting for a slice that never
+        comes) and that matches the exchange position, unchanged for risk.dust_residual_grace_s and worth
+        <= risk.dust_max_usdc, is flattened like a dust grid (top up, then reduce-only close) on its venue."""
+        rk = c.sym.risk
+        now = time.time()
+        cur = (sp.residual_maker, sp.residual_taker)
+        if not rk.dust_flatten or sp.grids or cur == (ZERO, ZERO):
+            c.resid_seen, c.resid_since = (), None
+            return
+        if cur != c.resid_seen or c.resid_since is None:
+            c.resid_seen, c.resid_since = cur, now
+            return
+        if now - c.resid_since < rk.dust_residual_grace_s or now < c.dust_next or c.key in self.exec_tasks:
+            return
+        legs = []
+        for vname, sym, attr in ((c.pair.maker, c.maker_sym, "residual_maker"), (c.pair.taker, c.taker_sym, "residual_taker")):
+            r = getattr(sp, attr)
+            if r == 0:
+                continue
+            v = self.venues[vname]
+            if self.guards.venue_paused(vname, now):
+                return
+            m, b = v.market(sym), v.book(sym)
+            if not (b and b.is_valid() and b.mid):
+                return
+            pos = self.exch_positions.get(vname, {}).get(sym)
+            if abs((pos.qty if pos is not None else ZERO) - r) > m.size_step / 2:
+                return  # local residual and exchange disagree: the reconcile deals with it first
+            qty = v.round_qty(sym, abs(r))
+            stuck = (qty < m.min_qty or qty * b.mid < m.min_notional or
+                     (vname == c.pair.maker and qty * b.mid < Decimal(str(c.sym.execution.hedge_min_notional_usdc))))
+            if not stuck:
+                continue  # tradable: settled by the normal residual path
+            value = float(abs(r) * b.mid)
+            if value > rk.dust_max_usdc:
+                note = f"{c.sym.key}: residual {r} on {vname} ({value:.2f} USDC) > dust_max_usdc {rk.dust_max_usdc:g}, not cleaned up automatically"
+                if note != c.dust_note:
+                    self.event(note, logging.WARNING)
+                    c.dust_note = note
+                continue
+            legs.append((vname, v, sym, attr, r, value))
+        if not legs:
+            return
+        self.event(f"WARNING {c.sym.key}: residual dust unchanged for {(now - c.resid_since) / 60:.0f} min; flattening "
+                   + ", ".join(f"{n} {r} ({x:.2f} USDC)" for n, _v, _s, _a, r, x in legs), logging.WARNING)
+        orders: list[dict] = []
+        before = {n: str(r) for n, _v, _s, _a, r, _x in legs}
+        for vname, v, sym, _a, r, _x in legs:
+            if await self._flatten_leg(c, v, sym, r, orders) is None:
+                self.journal("dust_flatten", symbol=c.sym.key, mode="residual", ok=False, before=before, orders=orders,
+                             error="unknown order outcome (halted)")
+                return
+        expect = {vname: (sym, r + _signed_fills(orders, vname)) for vname, _v, sym, _a, r, _x in legs}
+        got, source, seen = await self._settle_positions(expect)
+        for vname, _v, _s, attr, _r, _x in legs:
+            setattr(sp, attr, got[vname])
+        sp.updated = time.time()
+        self.positions.save()
+        after = {n: _dn(got[n]) for n in got}
+        ok = all(got[n] == 0 for n in got)
+        c.resid_seen, c.resid_since = (sp.residual_maker, sp.residual_taker), time.time()
+        if not ok:
+            c.dust_next = now + max(600.0, rk.failure_pause_s)
+        self.journal("dust_flatten", symbol=c.sym.key, mode="residual", ok=ok, before=before, orders=orders,
+                     after=after, source=source, exchange_seen=seen or None)
+        if ok:
+            self.event(f"{c.sym.key}: residual dust cleaned up ({len(orders)} order(s))")
+        else:
+            self.event(f"WARNING {c.sym.key}: residual dust clean-up incomplete: "
+                       + ", ".join(f"{n} {q}" for n, q in after.items())
+                       + f" - next attempt in about {max(600.0, rk.failure_pause_s, rk.dust_residual_grace_s) / 60:.0f} min",
+                       logging.WARNING)
+
+    async def _settle_positions(self, expect: dict) -> tuple[dict, str, dict]:
+        """v5.6.1: expect = {venue: (symbol, qty computed from the fills)}. Poll the venues' positions until
+        they agree with the computed quantities (exchange data can lag a few seconds behind the fills).
+        Returns ({venue: qty}, "exchange" | "computed", last exchange quantities seen). When the exchange does
+        not catch up in time the computed quantities are used; the regular reconcile verifies them later."""
+        seen: dict = {}
+        for _ in range(max(1, self.settle_attempts)):
+            if self.settle_delay_s > 0:
+                await asyncio.sleep(self.settle_delay_s)
+            try:
+                for vname, (sym, _exp) in expect.items():
+                    pos = await self.venues[vname].positions()
+                    self.exch_positions[vname] = pos
+                    p = pos.get(sym)
+                    seen[vname] = p.qty if p is not None else ZERO
+            except Exception as exc:  # noqa: BLE001 - try again; fall back to the computed quantities
+                log.warning("dust clean-up: positions failed: %s", exc)
+                continue
+            if all(abs(seen[v] - exp) <= self.venues[v].market(sym).size_step / 2 for v, (sym, exp) in expect.items()):
+                return {v: exp for v, (_s, exp) in expect.items()}, "exchange", {v: _dn(q) for v, q in seen.items()}
+        if seen:
+            self.event("dust clean-up: exchange positions " + ", ".join(f"{v} {q}" for v, q in seen.items())
+                       + " do not (yet) match the fills " + ", ".join(f"{v} {e}" for v, (_s, e) in expect.items())
+                       + " - using the fills; the next reconcile checks again", logging.WARNING)
+        return {v: exp for v, (_s, exp) in expect.items()}, "computed", {v: _dn(q) for v, q in seen.items()}
 
     async def _flatten_leg(self, c: Ctx, v: Venue, sym: str, q: Decimal, orders: list) -> Optional[bool]:
         """Close position q on venue v completely. Below the venue minimum: top up on the same side first.
+        v5.6.1: an order that does not fill completely is retried once with twice the slippage (thin book).
         None = an order had an unknown outcome (engine halted)."""
         rk, ex = c.sym.risk, c.sym.execution
         m = v.market(sym)
@@ -1324,21 +1439,22 @@ class Engine:
                 return False
             return x * b.mid >= m.min_notional * Decimal("1.05") or (reduce and v.reduce_only_any_notional)
 
-        async def send(is_buy: bool, qty: Decimal, reduce: bool, step: str):
-            st = await self.executor._ioc(v, sym, is_buy, qty, reduce, ex.hedge_slippage_pct, rk.max_quote_age_s)
+        async def send(is_buy: bool, qty: Decimal, reduce: bool, step: str, wide: bool):
+            slip = ex.hedge_slippage_pct * (2 if wide else 1)
+            st = await self.executor._ioc(v, sym, is_buy, qty, reduce, slip, rk.max_quote_age_s)
             if st is None:
                 orders.append(dict(venue=v.name, step=step, qty=str(qty), status="no fresh book"))
                 return None, False
             orders.append(dict(venue=v.name, step=step, side="buy" if is_buy else "sell", qty=str(qty), reduce_only=reduce,
                                filled=str(st.filled), price=str(st.avg_price or st.price), status=st.status.value,
-                               reason=getattr(st, "reason", None) or None))
+                               slippage_pct=slip, reason=getattr(st, "reason", None) or None))
             if st.status.value == "unknown":
                 self.halt(f"dust clean-up order on {v.name} ({sym}) has unknown outcome")
                 return st, True
             return st, False
 
         size = abs(q)
-        for _ in range(2):  # top up (same side) until a reduce-only close of everything is accepted
+        for attempt in range(2):  # top up (same side) until a reduce-only close of everything is accepted
             if tradable(size, True):
                 break
             b = v.book(sym)
@@ -1346,18 +1462,76 @@ class Engine:
             if float(add * b.mid) > max(2 * rk.dust_max_usdc, 3 * float(m.min_notional)):
                 orders.append(dict(venue=v.name, step="top-up", qty=str(add), status="refused: top-up too large"))
                 return False
-            st, unknown = await send(long_, add, False, "top-up")
+            st, unknown = await send(long_, add, False, "top-up", attempt > 0)
             if unknown:
                 return None
-            if st is None or st.filled <= 0:
-                return False
-            size += st.filled
+            if st is not None and st.filled > 0:
+                size += st.filled
         if not tradable(size, True):
             return False
-        st, unknown = await send(not long_, v.round_qty(sym, size), True, "close")
-        if unknown:
-            return None
-        return st is not None and st.filled > 0
+        for attempt in range(2):
+            st, unknown = await send(not long_, v.round_qty(sym, size), True, "close", attempt > 0)
+            if unknown:
+                return None
+            if st is not None and st.filled > 0:
+                size -= st.filled
+            if size <= 0:
+                return True
+            if not tradable(size, True):
+                return False
+        return False
+
+    # ------------------------------------------------------------ v5.6.1 threshold auto-tune advisor
+    async def _tune_loop(self) -> None:
+        """Every autotune.interval_s: evaluate the journal and record the advice (`tune_advice`). Advise only:
+        no parameter is ever changed here."""
+        from arb import tune
+        at = self.cfg.autotune
+        await asyncio.sleep(at.first_run_s)
+        while not self.stopping:
+            try:
+                await self.tune_once(tune)
+            except Exception as exc:  # noqa: BLE001 - advice must never break trading
+                log.warning("tune advice failed: %s", exc)
+            await asyncio.sleep(at.interval_s)
+
+    async def tune_once(self, tune=None) -> list:
+        if tune is None:
+            from arb import tune
+        at = self.cfg.autotune
+        fees = {c.sym.key: self._fees(c) for c in self.active_ctxs()}
+        keys = [c.sym.key for c in self.active_ctxs()]
+        rows = await asyncio.to_thread(tune.advise, self.cfg, self.journal_path, time.time(), keys, fees)
+        shown = [r for r in rows if r["n_all"] or r["action"] != "hold"]
+        self.journal("tune_advice", mode=at.mode, lookback_h=at.lookback_h, min_closes=at.min_closes, rows=shown)
+        changes = 0
+        for r in rows:
+            k = (r["symbol"], r["bucket"])
+            text = tune.advice_text(r)
+            if r["action"] != "hold":
+                changes += 1
+            if self._tune_last.get(k) != text and (r["action"] != "hold" or k in self._tune_last):
+                self.event(("WARNING " if r["action"] == "close_only" else "") + "tune advice " + text,
+                           logging.WARNING if r["action"] == "close_only" else logging.INFO)
+            self._tune_last[k] = text
+        log.info("tune advice: %d symbol/session(s) with closes, %d suggestion(s) (advise only, nothing changed)",
+                 sum(1 for r in rows if r["n_all"]), changes)
+        return rows
+
+
+def _dn(x: Decimal) -> str:
+    """Decimal without trailing zeros (0.00 -> 0) for the journal."""
+    return "0" if x == 0 else format(x.normalize(), "f")
+
+
+def _signed_fills(orders: list, venue: str) -> Decimal:
+    """Net signed filled quantity of the clean-up orders sent on `venue` (buy +, sell -)."""
+    out = ZERO
+    for o in orders:
+        if o.get("venue") == venue and o.get("filled") not in (None, "", "None"):
+            f = Decimal(str(o["filled"]))
+            out += f if o.get("side") == "buy" else -f
+    return out
 
 
 def _f(x) -> str:

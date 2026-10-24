@@ -186,6 +186,9 @@ class RiskConfig:
     dust_flatten: bool = True
     dust_max_usdc: float = 25.0
     dust_grace_s: float = 120.0
+    # v5.6.1: residual-only dust (no grid left, an unhedged leg below the exchange minimum, <= dust_max_usdc) that
+    # stayed unchanged this long is flattened on its venue the same way (top up, then reduce-only close)
+    dust_residual_grace_s: float = 1800.0
     # ---- v5.6: an open signal that is not traded (blocked / unstable / opposite position / ...) is logged and
     # journaled (signal_skip) at most once per this many seconds per symbol and reason. 0 = off.
     skip_log_s: float = 300.0
@@ -288,6 +291,44 @@ def pair_key(x: str, y: str) -> str:
     return f"{a}+{b}"
 
 
+# v5.6.1 threshold auto-tune advisor: default T1 bounds (%), by symbol first, then by category. Derived from the
+# 10-23/10-24 journal of process B (Lighter RH <-> Lighter): crypto lost money at T1 0.05, ANTHROPIC earned at
+# 0.06-0.15, OPENAI was mixed at 0.08-0.24. offhours_*: us_equity symbols with offhours_threshold_pct.
+DEFAULT_TUNE_BOUNDS: dict = {
+    "crypto": {"min": 0.08, "max": 0.25},
+    "us_equity": {"min": 0.08, "max": 0.30, "offhours_min": 0.12, "offhours_max": 0.40},
+    "other": {"min": 0.06, "max": 0.30},
+    "ANTHROPIC": {"min": 0.06, "max": 0.20},
+    "OPENAI": {"min": 0.10, "max": 0.25},
+    "MU": {"min": 0.10, "max": 0.25, "offhours_min": 0.20, "offhours_max": 0.40},
+}
+
+
+@dataclass
+class AutotuneConfig:
+    """v5.6.1: evaluate the realised PnL per symbol and threshold every interval_s and journal advice
+    (`tune_advice`). mode advise = never changes a parameter (the only mode in v5.6.1)."""
+    enabled: bool = True
+    mode: str = "advise"
+    interval_s: float = 3600.0
+    first_run_s: float = 120.0  # first evaluation this long after start
+    lookback_h: float = 168.0  # closes of the last N hours
+    min_closes: int = 30  # fewer closes at the current threshold: no advice (hold)
+    step_pct: float = 0.01  # one suggested change = this much T1
+    lower_bps: float = 1.0  # lower confidence bound of net bps/close > this -> suggest lowering T1
+    raise_bps: float = 0.0  # upper confidence bound < this -> suggest raising T1 (at max: close_only)
+    z: float = 1.645  # one-sided ~95% confidence
+    bounds: dict = field(default_factory=dict)  # merged over DEFAULT_TUNE_BOUNDS, e.g. {LIT: {min: 0.10, max: 0.30}}
+
+    def bounds_for(self, key: str, category: str) -> dict:
+        out: dict = {}
+        for k in (category, key):
+            out.update(DEFAULT_TUNE_BOUNDS.get(k, {}))
+        for k in (category, key):
+            out.update(self.bounds.get(k, {}) or {})
+        return out
+
+
 @dataclass
 class AppConfig:
     venues: dict[str, VenueConfig]
@@ -306,6 +347,7 @@ class AppConfig:
     guards: GuardsConfig = field(default_factory=GuardsConfig)
     auto_symbols: AutoSymbolsConfig = field(default_factory=AutoSymbolsConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    autotune: AutotuneConfig = field(default_factory=AutotuneConfig)
     source: str = ""
 
     def enabled_venues(self) -> list[str]:
@@ -388,7 +430,7 @@ def parse_venues(raw: dict) -> dict[str, VenueConfig]:
 def parse_config(raw: dict) -> AppConfig:
     raw = copy.deepcopy(raw)
     allowed_top = {"venues", "roles", "symbols", "defaults", "market_data", "trading", "paths", "sampler_interval_s", "markout_horizons_s",
-                   "ui_refresh_s", "guards", "auto_symbols", "ui"}
+                   "ui_refresh_s", "guards", "auto_symbols", "ui", "autotune"}
     if raw.get("symbols") == "auto":  # only auto symbols (expanded by arb/autosym.py before parsing)
         raw["symbols"] = {}
     unknown = {k for k in set(raw) - allowed_top if not str(k).startswith("x-")}  # x-*: YAML anchors
@@ -457,6 +499,7 @@ def parse_config(raw: dict) -> AppConfig:
         guards=_build(GuardsConfig, raw.get("guards") or {}, "guards"),
         auto_symbols=_build(AutoSymbolsConfig, raw.get("auto_symbols") or {}, "auto_symbols"),
         ui=_build(UiConfig, raw.get("ui") or {}, "ui"),
+        autotune=_build(AutotuneConfig, raw.get("autotune") or {}, "autotune"),
     )
     errors = validate(cfg)
     if errors:
@@ -483,6 +526,18 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"venues.{v.name}: maker_fee_pct/taker_fee_pct are required")
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):
             errs.append(f"venues.{v.name}.leverage must be 1..50")
+    at = cfg.autotune
+    if at.mode != "advise":
+        errs.append("autotune.mode: only 'advise' exists in v5.6.1 (suggestions are journaled, nothing is changed)")
+    if at.interval_s < 60 or at.lookback_h <= 0 or at.min_closes < 1 or at.step_pct <= 0 or at.z < 0:
+        errs.append("autotune: interval_s >= 60, lookback_h > 0, min_closes >= 1, step_pct > 0, z >= 0")
+    for k, b in (at.bounds or {}).items():
+        if not isinstance(b, dict) or set(b) - {"min", "max", "offhours_min", "offhours_max"}:
+            errs.append(f"autotune.bounds.{k}: use {{min, max, offhours_min, offhours_max}}")
+            continue
+        for lo, hi in (("min", "max"), ("offhours_min", "offhours_max")):
+            if lo in b and hi in b and not (0 < float(b[lo]) <= float(b[hi])):
+                errs.append(f"autotune.bounds.{k}: need 0 < {lo} <= {hi}")
     if any(h <= 0 or h > 600 for h in cfg.markout_horizons_s):
         errs.append("markout_horizons_s: delays must be in (0, 600] seconds")
     g = cfg.guards
@@ -548,8 +603,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.execution: hedge_max_orders >= hedge_max_attempts, hedge_min_notional_usdc >= 0")
         if st.min_close_profit_pct is not None and st.close_floor_timeout_s < 0:
             errs.append(f"{p}.strategy: close_floor_timeout_s must be >= 0")
-        if rk.dust_max_usdc < 0 or rk.dust_grace_s < 0 or rk.skip_log_s < 0:
-            errs.append(f"{p}.risk: dust_max_usdc, dust_grace_s and skip_log_s must be >= 0")
+        if rk.dust_max_usdc < 0 or rk.dust_grace_s < 0 or rk.skip_log_s < 0 or rk.dust_residual_grace_s < 0:
+            errs.append(f"{p}.risk: dust_max_usdc, dust_grace_s, dust_residual_grace_s and skip_log_s must be >= 0")
         if rk.warmup_fresh_s < 0 or rk.quick_resume_s < 0 or rk.max_leverage <= 0 or not (0 <= rk.reserve_ratio < 1):
             errs.append(f"{p}.risk: warmup_fresh_s>=0, quick_resume_s>=0, max_leverage>0, 0<=reserve_ratio<1")
         if ex.close_mode not in ("maker_taker", "taker_taker"):
@@ -590,6 +645,13 @@ def effective_t1(st: StrategyConfig, ts: Optional[float] = None) -> float:
     if st.session == "us_equity" and st.offhours_threshold_pct is not None and not us_regular_hours(ts):
         return st.offhours_threshold_pct
     return st.initial_threshold_pct
+
+
+def tune_bucket(st: StrategyConfig, ts: Optional[float] = None) -> str:
+    """v5.6.1: which threshold is in effect: all (one T1) | rth / off (us_equity with offhours_threshold_pct)."""
+    if st.session == "us_equity" and st.offhours_threshold_pct is not None:
+        return "rth" if us_regular_hours(ts) else "off"
+    return "all"
 
 
 def as_dict(obj: Any) -> Any:

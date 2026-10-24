@@ -439,6 +439,6 @@ def print_markout(events_path: Path, hours: Optional[float] = None, symbols: Opt
               + "".join(f(r["net"][h], 8) for h in hs))
     print(f"total: {int(tot_n)} fills, {tot_w:.0f} USDC maker notional")
     print("edge0 = 成交价相对对冲所中间价的价差；hedge = 对冲成本（正数=成本）；mM/mT@h = h 秒后挂单所/对冲所中间价的变化"
-          "（正=对我们有利，负=被行情碾过）；net@h = mM - mT - hedge = 对冲后按中间价估值。net@30/60 长期为负的标的，"
+          "（mM 正=挂单所价格朝有利方向走；mT 正=对冲所价格朝挂单方向走，对空/多的对冲腿不利，所以在 net 里减掉）；net@h = mM - mT - hedge = 对冲后按中间价估值。net@30/60 长期为负的标的，"
           "怎么挂都难赚纯价差。")
     return 0

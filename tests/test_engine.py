@@ -19,6 +19,7 @@ def make_engine(tmp_path, fake_pair, risk=None, execution=None, trading=None, **
     cfg = parse_config(raw)
     eng = Engine(cfg, {"lighter_rh": M, "lighter": T}, live=True)
     eng.build_contexts()
+    eng.settle_delay_s = 0  # v5.6.1: no waiting between position polls in tests
     now = time.time()
     for n in ("lighter", "lighter_rh"):
         eng.balances[n] = Balance(n, D("5000"), D("5000"), ts=now)
