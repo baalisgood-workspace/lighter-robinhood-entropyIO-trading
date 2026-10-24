@@ -21,6 +21,7 @@ from arb.engine.executor import ExecPlan, ExecResult, Executor
 from arb.engine.guards import Guards
 from arb.engine.state import PositionBook, SymbolPosition
 from arb.models import Balance, Position
+from arb.util import ceil_to_step
 from arb.venues.base import Venue
 
 log = logging.getLogger("arb.engine")
@@ -84,6 +85,10 @@ class Ctx:
     need_buy: Optional[float] = None
     gap: Optional[float] = None  # min(need - dev) over directions: <= 0 means an open signal
     unclosable: str = ""  # v5.3: why the top grid cannot be closed right now (warned once per change)
+    unclosable_since: Optional[float] = None  # v5.6: start of the current unclosable stretch (dust clean-up grace)
+    dust_next: float = 0.0  # v5.6: no dust clean-up attempt before this time (after a failed / refused one)
+    dust_note: str = ""  # v5.6: last "too large for clean-up" warning (warned once per change)
+    skip_logged: dict = field(default_factory=dict)  # v5.6: reason -> last time a skipped signal was logged
 
     @property
     def key(self) -> str:
@@ -516,6 +521,10 @@ class Engine:
                 log.exception("late fill booking")
             self.guards.tick(now)
             self.pause_text = self.guards.global_reason(now)
+            if self.live and self.pause_text and not self.halted:
+                for c in self.active_ctxs():  # v5.6: signals missed while every open is paused
+                    if c.gap is not None and c.gap <= 0 and not (self.cfg.close_only or c.sym.close_only):
+                        self._skip(c, now, "global pause", None, None, None, self.pause_text)
             if self.live and not self.halted and not self.stopping and not self.reconcile_due and not self.pause_text:
                 for c in self.active_ctxs():
                     if len(self.exec_tasks) >= self.cfg.max_parallel_slices:
@@ -703,7 +712,8 @@ class Engine:
         c.need_buy = base + self._funding(c, sg.BUY_MAKER)
         gaps = []
         for q, need in ((c.q_sell, c.need_sell), (c.q_buy, c.need_buy)):
-            if q is not None and q.ok and (not sp.direction or sp.direction == sg.POSITION_OF[q.direction]):
+            lock = sp.direction if sp.grids else None  # v5.6: residual dust without grids does not lock a direction
+            if q is not None and q.ok and (not lock or lock == sg.POSITION_OF[q.direction]):
                 gaps.append(need - q.dev)
         c.gap = min(gaps) if gaps else None
 
@@ -754,6 +764,9 @@ class Engine:
         t1 = effective_t1(st, now)
         min_qty = max(M.market(c.maker_sym).min_qty, T.market(c.taker_sym).min_qty)
         sp.merge_dust(min_qty)
+        if not sp.grids:
+            c.unclosable, c.unclosable_since = "", None
+        lock = sp.direction if sp.grids else None  # v5.6: residual dust without grids does not lock a direction
         basis_fn = (lambda: c.basis.ema or 0.0) if c.basis else (lambda: 0.0)
         tt = ex.close_mode == "taker_taker"
         thr = ex.maker_price_mode == "threshold"
@@ -784,6 +797,10 @@ class Engine:
                 if why:
                     self.event(f"{c.sym.key}: {why}", logging.WARNING)
                 c.unclosable = why
+            if not why:
+                c.unclosable_since = None
+            elif c.unclosable_since is None:
+                c.unclosable_since = now
             q = None
             if why:
                 c.status = why
@@ -811,13 +828,24 @@ class Engine:
 
         # ---------------- open
         topen: list[tuple[float, ExecPlan]] = []
-        if not (self.cfg.close_only or c.sym.close_only):
-            fees = self._fees(c)
+        fees = self._fees(c)
+        if self.cfg.close_only or c.sym.close_only:
+            for q in (c.q_sell, c.q_buy):  # v5.6: only journaled (intended), so `why_idle` can tell it apart
+                if q.ok and (not lock or lock == sg.POSITION_OF[q.direction]):
+                    need = sg.open_level(t1, st.grid_step_pct, min(len(sp.grids) + 1, st.max_grids)) + fees + self._funding(c, q.direction)
+                    if q.dev >= need:
+                        self._skip(c, now, "close_only", q.direction, q.dev, need, log_it=False)
+        else:
             for q in (c.q_sell, c.q_buy):
                 if not q.ok:
                     continue
                 pos_dir = sg.POSITION_OF[q.direction]
-                if sp.direction and sp.direction != pos_dir:
+                funding = self._funding(c, q.direction)
+                if lock and lock != pos_dir:
+                    need1 = sg.open_level(t1, st.grid_step_pct, 1) + fees + funding
+                    if q.dev >= need1:
+                        self._skip(c, now, "opposite position held", q.direction, q.dev, need1,
+                                   f"{lock} {sp.total_qty} in {len(sp.grids)} grid(s)")
                     continue
                 if sp.grids and sp.grids[-1].qty < sp.grids[-1].target_qty - min_qty:
                     level, target = sp.grids[-1].level, sp.grids[-1].target_qty
@@ -825,18 +853,24 @@ class Engine:
                 else:
                     level = len(sp.grids) + 1
                     if level > st.max_grids:
+                        needx = sg.open_level(t1, st.grid_step_pct, level) + fees + funding
+                        if q.dev >= needx:
+                            self._skip(c, now, "max_grids reached", q.direction, q.dev, needx, f"max_grids {st.max_grids}")
                         continue
                     target = self._rq(c, Decimal(str(st.grid_value_usdc)) / max(M.book(c.maker_sym).mid, T.book(c.taker_sym).mid))
                     remaining = target
-                funding = self._funding(c, q.direction)
                 need = sg.open_level(t1, st.grid_step_pct, level) + fees + funding
                 if c.next_open is None or need < c.next_open:
                     c.next_open = need
                 hourly_adverse = funding / max(rk.funding_horizon_hours, 1e-9)
                 if rk.funding_gate_enabled and hourly_adverse > rk.max_adverse_funding_hourly_pct:
+                    if q.dev >= need:
+                        self._skip(c, now, "funding gate", q.direction, q.dev, need, f"{hourly_adverse:.4f}%/h adverse")
                     continue
                 qty = self._rq(c, min(c.qty, remaining))
                 if qty < min_qty:
+                    if q.dev >= need:
+                        self._skip(c, now, "size below minimum", q.direction, q.dev, need, f"{qty} < {min_qty}")
                     continue
                 ot = ex.open_mode == "taker_taker"
                 plan = ExecPlan("open", c.pair, c.sym, c.maker_sym, c.taker_sym, q.direction, qty, level, need, basis_fn,
@@ -853,10 +887,12 @@ class Engine:
                     return None
                 if not self._stable(c):
                     c.status = "open signal, prices unstable"
+                    self._skip(c, now, "prices unstable", plan.direction, plan.required_dev - gap, plan.required_dev)
                     return None
                 why = self._open_blocked(c, plan, now)
                 if why:
                     c.status = f"blocked: {why}"
+                    self._skip(c, now, "blocked", plan.direction, plan.required_dev - gap, plan.required_dev, why)
                     return None
                 return plan
             if ex.open_mode == "taker_taker":
@@ -877,13 +913,35 @@ class Engine:
                 return None
         if not self._stable(c):
             c.status = f"{plan.kind} signal, prices unstable"
+            if plan.kind == "open" and gap <= 0:
+                self._skip(c, now, "prices unstable", plan.direction, plan.required_dev - gap, plan.required_dev)
             return None
         if plan.kind == "open":
             why = self._open_blocked(c, plan, now)
             if why:
                 c.status = f"blocked: {why}"
+                if gap <= 0:
+                    self._skip(c, now, "blocked", plan.direction, plan.required_dev - gap, plan.required_dev, why)
                 return None
         return plan
+
+    def _skip(self, c: Ctx, now: float, reason: str, direction: Optional[str], dev: Optional[float],
+              need: Optional[float], detail: str = "", log_it: bool = True) -> None:
+        """v5.6: an open signal (dev >= need) that was NOT traded, with the reason. Journaled as `signal_skip` and
+        logged at most once per risk.skip_log_s per symbol and reason (0 = off)."""
+        iv = c.sym.risk.skip_log_s
+        if iv <= 0 or not self.live:
+            return
+        key = reason + ("" if reason != "blocked" else ":" + detail.split(" ")[0])
+        if now - c.skip_logged.get(key, 0.0) < iv:
+            return
+        c.skip_logged[key] = now
+        self.journal("signal_skip", symbol=c.sym.key, direction=direction, reason=reason, detail=detail or None,
+                     dev=None if dev is None else round(dev, 4), need=None if need is None else round(need, 4))
+        if log_it:
+            log.info("signal not taken: %s %s dev %s >= need %s: %s%s", c.sym.key, direction or "-",
+                     "-" if dev is None else f"{dev:.3f}%", "-" if need is None else f"{need:.3f}%", reason,
+                     f" ({detail})" if detail else "")
 
     def _confirmed(self, c: Ctx, st, now: float) -> bool:
         """Spread persistence: the open signal must hold continuously for signal_confirm_s."""
@@ -1144,6 +1202,10 @@ class Engine:
         """Flatten unhedged leftovers that became tradable (only after a clean reconcile)."""
         for c in self.active_ctxs():
             sp = self.position(c)
+            if await self._dust_flatten(c, sp):
+                if self.halted:
+                    return
+                continue
             if await self._pair_off(c, sp):
                 if self.halted:
                     return
@@ -1171,6 +1233,131 @@ class Engine:
                     setattr(sp, attr, r + (st.filled if r < 0 else -st.filled))
                     self.positions.save()
                     self.event(f"residual {c.sym.key} on {vname}: flattened {st.filled}")
+
+
+    # ------------------------------------------------------------ v5.6 dust clean-up
+    async def _dust_flatten(self, c: Ctx, sp: SymbolPosition) -> bool:
+        """v5.6: a grid that has been unclosable for risk.dust_grace_s (below an exchange minimum on a leg, or a
+        close hedge that can never be sent) and whose legs are each worth <= risk.dust_max_usdc is flattened on
+        both venues with taker orders: a leg below the venue minimum is first topped up to the minimum (same
+        side), then closed completely with a reduce-only order. Afterwards the local state is set to the
+        exchange positions. Returns True when this symbol was handled here."""
+        rk = c.sym.risk
+        now = time.time()
+        if not (rk.dust_flatten and sp.grids and c.unclosable and c.unclosable_since is not None):
+            return False
+        if now - c.unclosable_since < rk.dust_grace_s or now < c.dust_next or c.key in self.exec_tasks:
+            return False
+        legs = []
+        for vname, sym in ((c.pair.maker, c.maker_sym), (c.pair.taker, c.taker_sym)):
+            v = self.venues[vname]
+            if self.guards.venue_paused(vname, now):
+                return False
+            pos = self.exch_positions.get(vname, {}).get(sym)
+            q = pos.qty if pos is not None else ZERO
+            b = v.book(sym)
+            if q and not (b and b.is_valid() and b.mid):
+                return False
+            value = float(abs(q) * b.mid) if q else 0.0
+            if value > rk.dust_max_usdc:
+                note = f"{c.sym.key}: {c.unclosable} - {vname} leg {q} ({value:.2f} USDC) > dust_max_usdc {rk.dust_max_usdc:g}, not cleaned up automatically"
+                if note != c.dust_note:
+                    self.event(note, logging.WARNING)
+                    c.dust_note = note
+                return False
+            legs.append((vname, v, sym, q, value))
+        before = {vname: str(q) for vname, _v, _s, q, _x in legs}
+        local_before = dict(direction=sp.direction, grids=[str(g.qty) for g in sp.grids],
+                            residual_maker=str(sp.residual_maker), residual_taker=str(sp.residual_taker))
+        why = c.unclosable
+        self.event(f"WARNING {c.sym.key}: dust clean-up ({why}); flattening "
+                   + ", ".join(f"{n} {q} ({x:.2f} USDC)" for n, _v, _s, q, x in legs), logging.WARNING)
+        orders: list[dict] = []
+        for vname, v, sym, q, _x in legs:
+            if q == 0:
+                continue
+            if await self._flatten_leg(c, v, sym, q, orders) is None:
+                self.journal("dust_flatten", symbol=c.sym.key, ok=False, reason=why, before=before, orders=orders,
+                             local_before=local_before, error="unknown order outcome (halted)")
+                return True
+        M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
+        try:
+            pm, pt = await M.positions(), await T.positions()
+        except Exception as exc:  # noqa: BLE001 - the next reconcile finds out; no new attempt for a while
+            c.dust_next = now + max(600.0, rk.failure_pause_s)
+            self.journal("dust_flatten", symbol=c.sym.key, ok=False, reason=why, before=before, orders=orders,
+                         local_before=local_before, error=f"positions: {exc}")
+            self.reconcile_due = True
+            log.warning("dust clean-up %s: positions failed: %s", c.sym.key, exc)
+            return True
+        self.exch_positions[M.name], self.exch_positions[T.name] = pm, pt
+        am = pm.get(c.maker_sym).qty if c.maker_sym in pm else ZERO
+        at = pt.get(c.taker_sym).qty if c.taker_sym in pt else ZERO
+        # local state := what the exchanges hold now (no grid; anything left is residual, settled as usual)
+        sp.grids.clear()
+        sp.direction = None
+        sp.residual_maker, sp.residual_taker = am, at
+        sp.updated = time.time()
+        self.positions.save()
+        c.unclosable, c.unclosable_since, c.dust_note = "", None, ""
+        ok = am == 0 and at == 0
+        self.journal("dust_flatten", symbol=c.sym.key, ok=ok, reason=why, before=before, orders=orders,
+                     local_before=local_before, after={M.name: str(am), T.name: str(at)})
+        if ok:
+            self.event(f"{c.sym.key}: dust clean-up done, both venues flat ({len(orders)} order(s))")
+        else:
+            c.dust_next = now + max(600.0, rk.failure_pause_s)
+            self.event(f"WARNING {c.sym.key}: dust clean-up incomplete: {M.name} {am}, {T.name} {at} "
+                       f"(kept as residual; next attempt in {max(600.0, rk.failure_pause_s):.0f}s)", logging.WARNING)
+        return True
+
+    async def _flatten_leg(self, c: Ctx, v: Venue, sym: str, q: Decimal, orders: list) -> Optional[bool]:
+        """Close position q on venue v completely. Below the venue minimum: top up on the same side first.
+        None = an order had an unknown outcome (engine halted)."""
+        rk, ex = c.sym.risk, c.sym.execution
+        m = v.market(sym)
+        long_ = q > 0
+
+        def tradable(x: Decimal, reduce: bool) -> bool:
+            b = v.book(sym)
+            if not (b and b.mid) or x < m.min_qty or x <= 0:
+                return False
+            return x * b.mid >= m.min_notional * Decimal("1.05") or (reduce and v.reduce_only_any_notional)
+
+        async def send(is_buy: bool, qty: Decimal, reduce: bool, step: str):
+            st = await self.executor._ioc(v, sym, is_buy, qty, reduce, ex.hedge_slippage_pct, rk.max_quote_age_s)
+            if st is None:
+                orders.append(dict(venue=v.name, step=step, qty=str(qty), status="no fresh book"))
+                return None, False
+            orders.append(dict(venue=v.name, step=step, side="buy" if is_buy else "sell", qty=str(qty), reduce_only=reduce,
+                               filled=str(st.filled), price=str(st.avg_price or st.price), status=st.status.value,
+                               reason=getattr(st, "reason", None) or None))
+            if st.status.value == "unknown":
+                self.halt(f"dust clean-up order on {v.name} ({sym}) has unknown outcome")
+                return st, True
+            return st, False
+
+        size = abs(q)
+        for _ in range(2):  # top up (same side) until a reduce-only close of everything is accepted
+            if tradable(size, True):
+                break
+            b = v.book(sym)
+            add = ceil_to_step(max(m.min_qty, m.min_notional * Decimal("1.1") / b.mid), m.size_step)
+            if float(add * b.mid) > max(2 * rk.dust_max_usdc, 3 * float(m.min_notional)):
+                orders.append(dict(venue=v.name, step="top-up", qty=str(add), status="refused: top-up too large"))
+                return False
+            st, unknown = await send(long_, add, False, "top-up")
+            if unknown:
+                return None
+            if st is None or st.filled <= 0:
+                return False
+            size += st.filled
+        if not tradable(size, True):
+            return False
+        st, unknown = await send(not long_, v.round_qty(sym, size), True, "close")
+        if unknown:
+            return None
+        return st is not None and st.filled > 0
 
 
 def _f(x) -> str:

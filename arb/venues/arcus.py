@@ -73,6 +73,7 @@ class ArcusUnknown(VenueError):
 class ArcusVenue(Venue):
     def __init__(self, cfg, env=None):
         super().__init__(cfg, env)
+        self.reduce_only_any_notional = True  # v5.6: _submit skips the min-notional check for reduce-only orders
         if getattr(cfg, "verify_cancel_rest", None) is None:
             cfg.verify_cancel_rest = True  # v5.2: Arcus pushes CANCELED and the fill on separate channels
         p = cfg.env_prefix

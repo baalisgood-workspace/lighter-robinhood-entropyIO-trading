@@ -151,6 +151,30 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.6：卡死的小残仓自动清理 / 残仓不再锁方向 / 没成交的信号写日志
+
+**1. 小残仓自动清理（`risk.dust_flatten`，默认开）**：某个网格因为低于交易所最小下单额而平不掉
+（日志 `not closable: ... below the ... minimum order` 或 `close hedge pending: ... (paired off after the reconcile)`），
+持续 `dust_grace_s`（默认 120 秒），并且两边交易所的实际持仓**每边都不超过 `dust_max_usdc`（默认 25 USDC）**时，
+在对账成功之后用吃单把这个标的两边都平掉：
+- 低于最小下单额的一边：先同方向补到最小额（约 1.1 倍最小额），再用 reduce-only 把整笔平掉；
+  够最小额的一边（Arcus 的 reduce-only 不受最小金额限制）直接 reduce-only 平掉。
+- 完成后本地记录改成交易所的实际持仓（正常情况两边都为 0），记一条 `dust_flatten`，界面事件日志也有提示。
+- 没平干净时剩下的记为残仓，至少 10 分钟后才会再试；任何订单结果未知 → 和其他地方一样停机等人工处理。
+- 成本：每边多两笔约 10~20U 的吃单，几分钱。超过 `dust_max_usdc` 的不自动处理，只告警一次。
+- 关闭：`risk: {dust_flatten: false}`（回到 v5.5：一直等）。
+
+**2. 残仓不再锁方向**：网格平完后只剩一点零头（如 `grids=[] residual maker=-0.004`）时，以前方向仍记着，
+反方向的开仓信号会被一直跳过；现在没有网格就不锁方向。
+
+**3. 没成交的开仓信号写日志（`risk.skip_log_s`，默认 300 秒，0 = 关）**：价差已到开仓门槛但没下单时，
+按"标的 + 原因"每 5 分钟最多记一次：日志 `signal not taken: ONDO sell_maker dev 0.21% >= need 0.15%: opposite position held (...)`，
+`events.jsonl` 记 `signal_skip`。原因包括：`opposite position held`（持有反方向仓位）、`max_grids reached`、
+`funding gate`、`size below minimum`、`prices unstable`（价格不稳定）、`blocked`（余额 / 仓位上限 / 杠杆 / 波动禁开等，
+细节在 detail 里）、`global pause`、`close_only`（只记事件不写日志）。
+
+仓库根目录的 `why_idle.py` 会汇总这些记录：`python3 why_idle.py --hours 8`。
+
 ## v5.5：成交后价格走势统计（markout）
 
 用来回答"挂单成交后价格往哪边走、对冲后到底赚不赚价差"，为以后决定要不要常驻挂单、哪些标的值得做提供数据。不改变任何下单逻辑。

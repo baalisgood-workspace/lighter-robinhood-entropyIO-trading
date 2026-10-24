@@ -53,6 +53,8 @@ class Venue(ABC):
         self._order_events: dict[str, asyncio.Event] = {}
         self.trading = False
         self.connected = False
+        # v5.6: reduce-only orders below min_notional are accepted (dust clean-up closes them in one order)
+        self.reduce_only_any_notional = False
         self.alive_ts = 0.0  # wall time of the last frame (incl. ping/pong) on the public market-data stream
         self.generation = 0  # incremented on every market-data (re)connect
         self.book_epoch: dict[str, int] = {}  # per-symbol: bumped whenever a book is invalidated

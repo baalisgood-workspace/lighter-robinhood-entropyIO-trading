@@ -109,7 +109,7 @@ class SymbolPosition:
                  maker_px: Optional[float] = None, taker_px: Optional[float] = None) -> None:
         if hedged <= 0:
             return
-        if self.direction is None:
+        if self.direction is None or not self.grids:  # v5.6: residual dust without grids does not lock a direction
             self.direction = direction
         assert self.direction == direction, "cannot add opposite direction"
         g = self.grids[-1] if self.grids and self.grids[-1].level == level else None

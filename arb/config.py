@@ -180,6 +180,15 @@ class RiskConfig:
     # like any residual) instead of halting. 0 = off (always halt, as before). Capped per symbol per hour.
     auto_adopt_max_usdc: float = 0.0
     auto_adopt_max_per_hour: int = 3
+    # ---- v5.6 dust clean-up: a grid that cannot be closed (a leg below the exchange minimum, or a close hedge
+    # that can never be sent) for dust_grace_s, with every leg worth <= dust_max_usdc, is flattened on both
+    # venues with taker orders (top up to the minimum, then reduce-only close). false = keep waiting (v5.5).
+    dust_flatten: bool = True
+    dust_max_usdc: float = 25.0
+    dust_grace_s: float = 120.0
+    # ---- v5.6: an open signal that is not traded (blocked / unstable / opposite position / ...) is logged and
+    # journaled (signal_skip) at most once per this many seconds per symbol and reason. 0 = off.
+    skip_log_s: float = 300.0
 
 
 @dataclass
@@ -539,6 +548,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.execution: hedge_max_orders >= hedge_max_attempts, hedge_min_notional_usdc >= 0")
         if st.min_close_profit_pct is not None and st.close_floor_timeout_s < 0:
             errs.append(f"{p}.strategy: close_floor_timeout_s must be >= 0")
+        if rk.dust_max_usdc < 0 or rk.dust_grace_s < 0 or rk.skip_log_s < 0:
+            errs.append(f"{p}.risk: dust_max_usdc, dust_grace_s and skip_log_s must be >= 0")
         if rk.warmup_fresh_s < 0 or rk.quick_resume_s < 0 or rk.max_leverage <= 0 or not (0 <= rk.reserve_ratio < 1):
             errs.append(f"{p}.risk: warmup_fresh_s>=0, quick_resume_s>=0, max_leverage>0, 0<=reserve_ratio<1")
         if ex.close_mode not in ("maker_taker", "taker_taker"):
