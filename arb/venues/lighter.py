@@ -235,6 +235,70 @@ class LighterVenue(Venue):
             m.extra.update(maker_fee_api=mpct, taker_fee_api=tpct, fee_src=f"{self.name} {tier}")
         self._fee_note = f"account tier {tier}, ticks maker {mk} / taker {tk}"
 
+    # ------------------------------------------------------------ points (v5.7.1, read-only)
+    async def _read_token(self) -> tuple[str, Any]:
+        """Auth token for read-only calls; returns (token, temporary signer to close or None)."""
+        import lighter  # lazy: native signer library
+
+        tmp = None
+        signer = self.signer
+        if signer is None:
+            tmp = signer = lighter.SignerClient(url=self.cfg.rest_url, account_index=int(self.account_index),
+                                                api_private_keys={int(self.api_key_index): self._api_private_key},
+                                                chain_id=self.cfg.chain_id)
+        token, err = signer.create_auth_token_with_expiry(api_key_index=int(self.api_key_index))
+        if err:
+            if tmp is not None:
+                await tmp.close()
+            raise VenueError(f"{self.name}: auth token error: {err}")
+        return token, tmp
+
+    async def my_trades(self, since_ts: float, max_pages: int = 200) -> list[dict]:
+        """Own fills since since_ts (seconds), newest first, from /api/v1/trades (100 per page)."""
+        token, tmp = await self._read_token()
+        out: list[dict] = []
+        try:
+            cursor = None
+            for _ in range(max_pages):
+                params = {"account_index": self.account_index, "sort_by": "timestamp", "sort_dir": "desc", "limit": 100}
+                if cursor:
+                    params["cursor"] = cursor
+                d = await self._get("/api/v1/trades", params, headers={"authorization": token})
+                page = d.get("trades") or []
+                old = False
+                for t in page:
+                    if float(t.get("timestamp") or 0) / 1000 < since_ts:
+                        old = True
+                        break
+                    out.append(t)
+                cursor = d.get("next_cursor")
+                if old or not page or not cursor:
+                    break
+        finally:
+            if tmp is not None:
+                try:
+                    await tmp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return out
+
+    async def live_points(self) -> Optional[float]:
+        """Live points total of this account (Lighter on Robinhood Chain only; None where not available)."""
+        token, tmp = await self._read_token()
+        try:
+            d = await self._get("/api/v1/livePoints/total", {"account_index": self.account_index},
+                                headers={"authorization": token})
+            v = d.get("total_live_points")
+            return None if v is None else float(v)
+        except VenueError:
+            return None
+        finally:
+            if tmp is not None:
+                try:
+                    await tmp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def _account(self, max_age: float = 2.0) -> dict:
         async with self._account_lock:
             now = time.time()

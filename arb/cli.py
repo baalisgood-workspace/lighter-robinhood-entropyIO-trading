@@ -1,4 +1,4 @@
-"""Command line entry point: check | monitor | live | positions | fees | markout | tune | report."""
+"""Command line entry point: check | monitor | live | positions | fees | points | markout | tune | report."""
 from __future__ import annotations
 
 import argparse
@@ -252,6 +252,51 @@ async def _positions(cfg: AppConfig) -> int:
     return 0
 
 
+async def _points(cfg: AppConfig, days: float, save: bool) -> int:
+    """v5.7.1: own Lighter / Lighter RH fills that can earn points (not standard-to-standard) and the live points
+    total (read-only; safe while the bot runs). Appends a points snapshot unless --no-save."""
+    from arb import points as pts
+    from arb.venues import build_venue
+    try:
+        pair = cfg.active_pair()
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    hist = instance_dir(cfg, True) / pts.HISTORY_FILE
+    vs = {}
+    try:
+        for n in (pair.maker, pair.taker):
+            if cfg.venues[n].kind != "lighter":
+                continue
+            if not _creds_present(cfg, n):
+                print(f"== {n}: no credentials in the env file, skipped")
+                continue
+            v = build_venue(cfg.venues[n])
+            await v.start(cfg.symbols_for_venue(n), trading=False)
+            vs[n] = v
+            now = time.time()
+            acct = int(v.account_index)
+            prev = pts.last_snapshot(hist, n)
+            since = now - days * 86400
+            if prev is not None and now - float(prev["ts"]) <= 30 * 86400:
+                since = min(since, float(prev["ts"]))
+            trades = await v.my_trades(since)
+            window = [t for t in trades if float(t.get("timestamp") or 0) / 1000 >= now - days * 86400]
+            vol_prev = None
+            if prev is not None and now - float(prev["ts"]) <= 30 * 86400:
+                vol_prev = sum(c["usd"] for c in (pts.classify(t, acct) for t in trades
+                                                    if float(t.get("timestamp") or 0) / 1000 >= float(prev["ts"])) if c)
+            p = await v.live_points()
+            print(pts.render(n, acct, days, pts.summarize(window, acct, v._symbol_by_mid), p, prev, vol_prev, now))
+            if save and p is not None:
+                pts.append_snapshot(hist, n, acct, p, now)
+        if save:
+            print(f"\n(points snapshot appended to {hist}; run again in a few days for points per volume)")
+        return 0
+    finally:
+        await _stop_venues(vs)
+
+
 async def _fees(cfg: AppConfig) -> int:
     """v5.4: fees the bot will use per symbol (exchange/account-reported, read-only; safe while the bot runs)."""
     from arb.engine.signals import roundtrip_fee_pct
@@ -389,6 +434,9 @@ def main(argv: list[str] | None = None) -> int:
     lv.add_argument("--no-ui", action="store_true")
     common(sub.add_parser("positions", help="show exchange balances/positions and local state"))
     common(sub.add_parser("fees", help="fees per symbol from the exchanges / account tiers (read-only)"))
+    pt = common(sub.add_parser("points", help="own Lighter fills that can earn points + live points total (read-only)"))
+    pt.add_argument("--days", type=float, default=7.0, help="window of own fills (default 7)")
+    pt.add_argument("--no-save", action="store_true", help="do not append a points snapshot")
     mo = common(sub.add_parser("markout", help="price moves after maker fills (adverse selection), from the live journal"))
     mo.add_argument("--hours", type=float, default=None, help="only the last N hours")
     mo.add_argument("--symbols", help="comma list")
@@ -501,6 +549,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_positions(cfg))
     if args.cmd == "fees":
         return asyncio.run(_fees(cfg))
+    if args.cmd == "points":
+        return asyncio.run(_points(cfg, args.days, not args.no_save))
     if args.cmd == "accept-flat":
         try:
             with _lock(instance_dir(cfg, True)):

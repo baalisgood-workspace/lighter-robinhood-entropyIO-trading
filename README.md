@@ -151,6 +151,21 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.7.1：`arb points` 积分统计（只读）
+
+Lighter on Robinhood Chain 的积分规则：**标准账户对标准账户的成交不给积分**（实时积分、周积分都不给），至少一方付了手续费
+（高级账户）才算。每笔成交记录都带双方手续费，所以能算出自己的成交里有多少能拿积分：
+
+```bash
+.venv/bin/python -m arb --config config/lighter_rh.yaml points            # 最近 7 天，按标的列出成交量 / 能拿积分的量 / 占比
+.venv/bin/python -m arb --config config/lighter_rh.yaml points --days 3
+```
+
+- 只读（不下单、不改设置），机器人运行中也能跑；需要 `.env` 里的 Lighter 密钥（用来查积分总数）。
+- RH 账户会显示当前积分总数，并追加一条记录到 `data/<交易对>/points_history.jsonl`；下次再跑会显示「距上次 +多少积分、
+  这期间自己成交多少、每 1 万 USDC 成交量换多少积分」。`--no-save` 不写记录。
+- Lighter 主网的成交记录里没有手续费字段时，占比会显示 0%，不代表真的拿不到（主网积分是另一套规则）。
+
 ## v5.7：门槛自动调整（刷量保本模式）/ 资金费率套利开关 / 新交易对怎么选
 
 **1. 门槛自动调整（`autotune.mode: apply`，默认仍是 `advise` 只建议）**：v5.6.1 的建议改成由运行中的机器人直接执行。
