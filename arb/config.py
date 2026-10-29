@@ -97,6 +97,17 @@ class StrategyConfig:
     signal_confirm_s: float = 0.0
     # us_equity session: false = no new opens outside NY regular hours at all (closes keep working)
     offhours_open: bool = True
+    # v5.7 funding carry (off by default). When the funding difference pays the hedged position at least
+    # carry_min_hourly_pct (%/h, net of both legs), that direction opens earlier: the trigger is lowered by the
+    # funding expected over carry_credit_hours, but never below fees + carry_min_open_pct. An open grid is then
+    # held (no close) while the funding still pays >= carry_exit_hourly_pct and the oldest grid is younger than
+    # carry_max_hold_hours. close_only (global or symbol) always closes normally. Holding means less volume.
+    funding_carry: bool = False
+    carry_min_hourly_pct: float = 0.005  # 0.005 %/h = 0.12 %/day ~ 44 %/year on the notional of one leg
+    carry_exit_hourly_pct: float = 0.001
+    carry_credit_hours: float = 8.0
+    carry_min_open_pct: float = 0.0
+    carry_max_hold_hours: Optional[float] = 72.0
 
 
 @dataclass
@@ -307,9 +318,13 @@ DEFAULT_TUNE_BOUNDS: dict = {
 @dataclass
 class AutotuneConfig:
     """v5.6.1: evaluate the realised PnL per symbol and threshold every interval_s and journal advice
-    (`tune_advice`). mode advise = never changes a parameter (the only mode in v5.6.1)."""
+    (`tune_advice`). mode advise = never changes a parameter. v5.7 mode apply = the running bot moves T1 one
+    step as advised (within the bounds), keeps it in data/<pair>/tune_applied.json across restarts and journals
+    `tune_apply`; editing that T1 in the config file discards the applied value. A close_only advice is only
+    applied with apply_close_only. Volume farming at break-even: lower_bps 0, raise_bps 0."""
     enabled: bool = True
     mode: str = "advise"
+    apply_close_only: bool = False
     interval_s: float = 3600.0
     first_run_s: float = 120.0  # first evaluation this long after start
     lookback_h: float = 168.0  # closes of the last N hours
@@ -527,8 +542,8 @@ def validate(cfg: AppConfig) -> list[str]:
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):
             errs.append(f"venues.{v.name}.leverage must be 1..50")
     at = cfg.autotune
-    if at.mode != "advise":
-        errs.append("autotune.mode: only 'advise' exists in v5.6.1 (suggestions are journaled, nothing is changed)")
+    if at.mode not in ("advise", "apply"):
+        errs.append("autotune.mode must be advise (journal suggestions only) or apply (move T1 as advised)")
     if at.interval_s < 60 or at.lookback_h <= 0 or at.min_closes < 1 or at.step_pct <= 0 or at.z < 0:
         errs.append("autotune: interval_s >= 60, lookback_h > 0, min_closes >= 1, step_pct > 0, z >= 0")
     for k, b in (at.bounds or {}).items():
@@ -580,6 +595,11 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}: offhours_threshold_pct must be > 0")
         if st.signal_confirm_s < 0:
             errs.append(f"{p}.strategy.signal_confirm_s must be >= 0")
+        if st.funding_carry and not (0 < st.carry_exit_hourly_pct <= st.carry_min_hourly_pct and st.carry_credit_hours >= 0
+                                     and st.carry_min_open_pct >= 0
+                                     and (st.carry_max_hold_hours is None or st.carry_max_hold_hours > 0)):
+            errs.append(f"{p}.strategy: funding carry needs 0 < carry_exit_hourly_pct <= carry_min_hourly_pct, "
+                        f"carry_credit_hours >= 0, carry_min_open_pct >= 0, carry_max_hold_hours > 0 or null")
         if rk.volatility_max_pct is not None and (rk.volatility_max_pct <= 0 or rk.volatility_window_s <= 0 or rk.volatility_block_s < 0):
             errs.append(f"{p}.risk: volatility_max_pct/volatility_window_s must be > 0")
         if rk.max_leg_spread_pct is not None and rk.max_leg_spread_pct <= 0:

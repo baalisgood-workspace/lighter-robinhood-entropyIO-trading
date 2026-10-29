@@ -467,6 +467,9 @@ def main(argv: list[str] | None = None) -> int:
         syms = args.symbols.split(",") if args.symbols else None
         if args.log:
             return print_tune_log(path, args.hours or 24.0, syms)
+        from arb.tune import APPLIED_FILE, load_applied
+        for line in load_applied(cfg, path.parent / APPLIED_FILE):  # v5.7: thresholds the bot moved (mode apply)
+            print(f"in effect: {line}")
         return print_tune(cfg, path, args.hours, syms, args.all)
     if args.cmd == "markets":
         from arb.markets import fetch_all, render

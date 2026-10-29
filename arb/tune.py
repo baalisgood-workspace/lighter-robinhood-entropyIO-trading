@@ -1,4 +1,5 @@
-"""v5.6.1 threshold auto-tune advisor (advise only: it never changes a parameter).
+"""v5.6.1 threshold auto-tune advisor (advise only: it never changes a parameter). v5.7: autotune.mode apply
+lets the running bot apply the advice (Engine.tune_once); applied values live in data/<pair>/tune_applied.json.
 
 Every close in the journal (events.jsonl, kind "close") carries the gross two-leg PnL of the closed quantity.
 Each close is attributed to the T1 (initial threshold, %) and session bucket in effect when its grid was opened
@@ -203,6 +204,70 @@ def advise(cfg: AppConfig, events_path: Path, now: Optional[float] = None, keys:
     return rows
 
 
+APPLIED_FILE = "tune_applied.json"
+
+
+def set_bucket_t1(sc: SymbolConfig, bucket: str, t1: float) -> None:
+    if bucket == "off":
+        sc.strategy.offhours_threshold_pct = t1
+    else:
+        sc.strategy.initial_threshold_pct = t1
+
+
+def read_applied(path: Path) -> dict:
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_applied(path: Path, data: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+    tmp.replace(p)
+
+
+def load_applied(cfg: AppConfig, path: Path) -> list[str]:
+    """v5.7 (autotune.mode apply): put the thresholds the bot moved earlier back into cfg. An entry only counts
+    while the config file still has the value it replaced (config_t1); after a manual edit the file wins.
+    Returns one line per value used."""
+    out: list[str] = []
+    for key, ent in read_applied(path).items():
+        sc = cfg.symbols.get(key)
+        if sc is None or not isinstance(ent, dict):
+            continue
+        for bucket in buckets(sc):
+            e = ent.get(bucket)
+            if isinstance(e, dict) and e.get("t1") is not None and abs(bucket_t1(sc, bucket) - float(e.get("config_t1", -1))) < EPS:
+                set_bucket_t1(sc, bucket, float(e["t1"]))
+                sess = "" if bucket == "all" else f" [{bucket}]"
+                out.append(f"{key}{sess}: T1 {float(e['config_t1']):g}% -> {float(e['t1']):g}% (autotune)")
+        co = ent.get("close_only")
+        if isinstance(co, dict) and co.get("config") is False and not sc.close_only:
+            sc.close_only = True
+            out.append(f"{key}: close_only (autotune)")
+    return out
+
+
+def record_applied(path: Path, sc: SymbolConfig, bucket: str, old_t1: float, new_t1: float, now: float) -> None:
+    data = read_applied(path)
+    ent = data.setdefault(sc.key, {})
+    prev = ent.get(bucket) if isinstance(ent.get(bucket), dict) else None
+    # config_t1 = the value in the config file, kept from the first change on
+    config_t1 = float(prev["config_t1"]) if prev and abs(float(prev.get("t1", -1)) - old_t1) < EPS else old_t1
+    ent[bucket] = dict(t1=new_t1, config_t1=config_t1, ts=round(now, 1))
+    write_applied(path, data)
+
+
+def record_close_only(path: Path, sc: SymbolConfig, now: float) -> None:
+    data = read_applied(path)
+    data.setdefault(sc.key, {})["close_only"] = dict(config=False, ts=round(now, 1))
+    write_applied(path, data)
+
+
 def advice_text(r: dict) -> str:
     sess = "" if r["bucket"] == "all" else f" [{'US hours' if r['bucket'] == 'rth' else 'off-hours'}]"
     if r["action"] in ("lower", "raise"):
@@ -221,7 +286,8 @@ def print_tune(cfg: AppConfig, events_path: Path, hours: Optional[float] = None,
     rows = advise(cfg, events_path, hours=hours, keys=symbols)
     at = cfg.autotune
     lb = at.lookback_h if hours is None else hours
-    print(f"threshold advice (advise only - nothing is changed), last {lb:g}h, min {at.min_closes} closes, "
+    mode = "advise only - nothing is changed" if at.mode == "advise" else "autotune.mode apply: the running bot applies it"
+    print(f"threshold advice ({mode}), last {lb:g}h, min {at.min_closes} closes, "
           f"step {at.step_pct:g}%, lower if lower bound > {at.lower_bps:g} bps, raise if upper bound < {at.raise_bps:g} bps")
     print(f"{'symbol':<12}{'sess':<5}{'T1%':>6}{'min-max':>12}{'closes':>7}{'notional':>10}{'net U':>8}{'bps':>7}"
           f"{'low':>7}{'high':>7}  advice")

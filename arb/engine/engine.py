@@ -91,6 +91,7 @@ class Ctx:
     skip_logged: dict = field(default_factory=dict)  # v5.6: reason -> last time a skipped signal was logged
     resid_seen: tuple = ()  # v5.6.1: (maker, taker) residual without grids at the last check ...
     resid_since: Optional[float] = None  # ... unchanged since then (residual dust clean-up grace)
+    carry_hold: bool = False  # v5.7: closes held for funding carry (event on every change)
 
     @property
     def key(self) -> str:
@@ -219,6 +220,10 @@ class Engine:
                 self.ctxs.append(Ctx(pair=pair, sym=s, maker_sym=ms, taker_sym=ts, basis=basis))
         if self.active and not any(c.pair == self.active for c in self.ctxs):
             raise ConfigError(f"no tradable symbol for active pair {self.active.key}")
+        if self.live:  # v5.7: thresholds moved earlier by autotune.mode apply
+            from arb import tune
+            for line in tune.load_applied(self.cfg, self.data_dir / tune.APPLIED_FILE):
+                self.event(f"tune applied earlier: {line}")
         self._assign_policies()
 
     def _assign_policies(self) -> None:
@@ -714,9 +719,10 @@ class Engine:
         st = c.sym.strategy
         sp = self.position(c)
         level = min(len(sp.grids) + 1, st.max_grids)
-        base = sg.open_level(effective_t1(st, now), st.grid_step_pct, level) + self._fees(c)
-        c.need_sell = base + self._funding(c, sg.SELL_MAKER)
-        c.need_buy = base + self._funding(c, sg.BUY_MAKER)
+        fees = self._fees(c)
+        base = sg.open_level(effective_t1(st, now), st.grid_step_pct, level) + fees
+        c.need_sell = self._carry_need(c, sg.SELL_MAKER, base + self._funding(c, sg.SELL_MAKER), fees)
+        c.need_buy = self._carry_need(c, sg.BUY_MAKER, base + self._funding(c, sg.BUY_MAKER), fees)
         gaps = []
         for q, need in ((c.q_sell, c.need_sell), (c.q_buy, c.need_buy)):
             lock = sp.direction if sp.grids else None  # v5.6: residual dust without grids does not lock a direction
@@ -736,6 +742,31 @@ class Engine:
         M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
         return sg.adverse_funding_pct(direction, M.funding_hourly.get(c.maker_sym), T.funding_hourly.get(c.taker_sym),
                                       c.sym.risk.funding_horizon_hours)
+
+    def _earned_hourly(self, c: Ctx, direction: str) -> Optional[float]:
+        """v5.7: net funding the position opened by `direction` receives, %/h (None if a rate is unknown)."""
+        M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
+        return sg.funding_earned_hourly_pct(direction, M.funding_hourly.get(c.maker_sym), T.funding_hourly.get(c.taker_sym))
+
+    def _carry_need(self, c: Ctx, direction: str, need: float, fees: float) -> float:
+        st = c.sym.strategy
+        if not st.funding_carry or self.cfg.close_only or c.sym.close_only:
+            return need
+        return sg.carry_need(need, self._earned_hourly(c, direction), fees, st.carry_min_hourly_pct,
+                             st.carry_credit_hours, st.carry_min_open_pct)
+
+    def _carry_holding(self, c: Ctx, sp, now: float) -> str:
+        """v5.7: why the open grids are held for funding (empty = close normally)."""
+        st = c.sym.strategy
+        if not st.funding_carry or self.cfg.close_only or c.sym.close_only or not sp.grids:
+            return ""
+        earned = self._earned_hourly(c, sg.OPEN_DIRECTION[sp.direction])
+        if earned is None or earned < st.carry_exit_hourly_pct:
+            return ""
+        age_h = (now - min(g.opened_ts for g in sp.grids)) / 3600
+        if st.carry_max_hold_hours is not None and age_h >= st.carry_max_hold_hours:
+            return ""
+        return f"funding carry: holding, earns {earned:.4f}%/h, oldest grid {age_h:.1f}h"
 
     def _venue_notional(self, venue: str) -> float:
         total = 0.0
@@ -809,8 +840,15 @@ class Engine:
             elif c.unclosable_since is None:
                 c.unclosable_since = now
             q = None
+            hold = "" if why else self._carry_holding(c, sp, now)
+            if bool(hold) != c.carry_hold:
+                c.carry_hold = bool(hold)
+                self.event(f"{c.sym.key}: {hold or 'funding carry: hold ended, closing normally'}")
+                self.journal("carry_hold", symbol=c.sym.key, hold=bool(hold), detail=hold or None)
             if why:
                 c.status = why
+            elif hold:
+                c.status = hold
             else:
                 q = sg.build_quote(cdir, mb, tb, qty, c.basis_value, ex.maker_price_mode if not thr else "join",
                                    M.price_tick_at(c.maker_sym, mb.mid), rk.depth_levels, rk.depth_band_pct, maker_as_taker=tt)
@@ -866,7 +904,7 @@ class Engine:
                         continue
                     target = self._rq(c, Decimal(str(st.grid_value_usdc)) / max(M.book(c.maker_sym).mid, T.book(c.taker_sym).mid))
                     remaining = target
-                need = sg.open_level(t1, st.grid_step_pct, level) + fees + funding
+                need = self._carry_need(c, q.direction, sg.open_level(t1, st.grid_step_pct, level) + fees + funding, fees)
                 if c.next_open is None or need < c.next_open:
                     c.next_open = need
                 hourly_adverse = funding / max(rk.funding_horizon_hours, 1e-9)
@@ -1483,8 +1521,8 @@ class Engine:
 
     # ------------------------------------------------------------ v5.6.1 threshold auto-tune advisor
     async def _tune_loop(self) -> None:
-        """Every autotune.interval_s: evaluate the journal and record the advice (`tune_advice`). Advise only:
-        no parameter is ever changed here."""
+        """Every autotune.interval_s: evaluate the journal and record the advice (`tune_advice`). mode advise: no
+        parameter is changed; v5.7 mode apply: T1 moves as advised (_tune_apply)."""
         from arb import tune
         at = self.cfg.autotune
         await asyncio.sleep(at.first_run_s)
@@ -1514,9 +1552,40 @@ class Engine:
                 self.event(("WARNING " if r["action"] == "close_only" else "") + "tune advice " + text,
                            logging.WARNING if r["action"] == "close_only" else logging.INFO)
             self._tune_last[k] = text
-        log.info("tune advice: %d symbol/session(s) with closes, %d suggestion(s) (advise only, nothing changed)",
-                 sum(1 for r in rows if r["n_all"]), changes)
+        applied = self._tune_apply(rows, tune) if at.mode == "apply" else 0
+        log.info("tune advice: %d symbol/session(s) with closes, %d suggestion(s), %d applied (mode %s)",
+                 sum(1 for r in rows if r["n_all"]), changes, applied, at.mode)
         return rows
+
+    def _tune_apply(self, rows: list, tune) -> int:
+        """v5.7 autotune.mode apply: move T1 one step as advised (bounds are enforced by the advisor) and keep
+        it in tune_applied.json; close_only advice only with apply_close_only."""
+        at = self.cfg.autotune
+        path = self.data_dir / tune.APPLIED_FILE
+        now = time.time()
+        n = 0
+        for r in rows:
+            sc = self.cfg.symbols.get(r["symbol"])
+            if sc is None:
+                continue
+            sess = "" if r["bucket"] == "all" else f" [{r['bucket']}]"
+            if r["action"] in ("lower", "raise") and r["target"] is not None:
+                old = tune.bucket_t1(sc, r["bucket"])
+                new = float(r["target"])
+                if abs(new - old) < tune.EPS:
+                    continue
+                tune.set_bucket_t1(sc, r["bucket"], new)
+                tune.record_applied(path, sc, r["bucket"], old, new, now)
+                self.journal("tune_apply", symbol=sc.key, bucket=r["bucket"], old_t1=old, new_t1=new, why=r["why"])
+                self.event(f"tune applied: {sc.key}{sess} T1 {old:g}% -> {new:g}% ({r['why']})", logging.WARNING)
+                n += 1
+            elif r["action"] == "close_only" and at.apply_close_only and not sc.close_only:
+                sc.close_only = True
+                tune.record_close_only(path, sc, now)
+                self.journal("tune_apply", symbol=sc.key, bucket=r["bucket"], close_only=True, why=r["why"])
+                self.event(f"WARNING tune applied: {sc.key} close_only ({r['why']})", logging.WARNING)
+                n += 1
+        return n
 
 
 def _dn(x: Decimal) -> str:

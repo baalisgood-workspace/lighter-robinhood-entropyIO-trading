@@ -151,6 +151,66 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.7：门槛自动调整（刷量保本模式）/ 资金费率套利开关 / 新交易对怎么选
+
+**1. 门槛自动调整（`autotune.mode: apply`，默认仍是 `advise` 只建议）**：v5.6.1 的建议改成由运行中的机器人直接执行。
+每次评估（默认每小时）按建议把 T1 移一档（`step_pct`，不超出 `bounds`），写日志 `tune_apply`、事件日志 `tune applied: ...`，
+并存到 `data/<交易对>/tune_applied.json`，重启后继续用。**手动改了配置文件里这个标的的 T1，就以配置文件为准**（记录作废）。
+建议 `close_only`（已到上限还在亏）默认只提示，`apply_close_only: true` 才会真的停开仓（同样记住，重启后仍然只平仓；
+要恢复就删掉 `tune_applied.json` 里这个标的的 `close_only` 项）。降一档后要在新门槛下再攒够 `min_closes` 笔才会再动，所以变化是渐进的。
+
+刷积分（不亏就行、交易量越大越好）的设置：
+
+```yaml
+autotune:
+  mode: apply
+  lower_bps: 0          # 当前门槛显著不亏（置信下限 > 0）就降一档 → 更多成交
+  raise_bps: 0          # 显著亏（置信上限 < 0）就升一档
+  min_closes: 20        # 攒多少笔才判断（越小反应越快、误判越多）
+  apply_close_only: true
+  bounds:               # 能降到多低 / 升到多高（按标的或类别）
+    crypto: {min: 0.06, max: 0.25}
+```
+
+`python -m arb tune --config ...` 会先打印当前实际生效的门槛（`in effect: ...`）。
+
+**2. 资金费率套利（`strategy.funding_carry`，默认关，可按标的开）**：对冲仓位两边资金费率之差对这个方向有利、且
+≥ `carry_min_hourly_pct`（%/小时，默认 0.005 ≈ 年化 44%）时：
+- 开仓更积极：开仓线减去 `carry_credit_hours`（默认 8 小时）的预期资金费收入，但不低于 往返手续费 + `carry_min_open_pct`；只对能收资金费的方向生效。
+- 持有不平：已有仓位只要资金费还 ≥ `carry_exit_hourly_pct`（默认 0.001 %/h）且最老的网格不超过 `carry_max_hold_hours`（默认 72 小时）就不平仓
+  （面板显示 `funding carry: holding ...`，日志 `carry_hold`）；资金费变差或到期后按正常平仓线平。
+- `close_only`（全局或标的）时完全不起作用。持仓不动 = 不刷量，刷量的标的不要开。
+
+```yaml
+defaults:
+  strategy:
+    funding_carry: false        # 全局关
+symbols:
+  XXX:
+    strategy: {funding_carry: true, carry_min_hourly_pct: 0.005, carry_max_hold_hours: 72}
+```
+
+**3. 新交易对：先监控再交易**。2026-10-28 的共同标的（`arb markets`）：
+
+| 交易对 | 共同标的数 | 说明 |
+|---|---|---|
+| lighter + lighter_rh | 49 | 服务器 B 在跑 |
+| lighter + entropy | 9 | OPENAI、ANTHROPIC、NBIS、NVDA、SNDK、DRAM、EWY、PRL、XIAOMI；10-22 的 1 小时监控里 OPENAI 价差 ≥0.08% 约 26 次/小时 |
+| lighter_rh + entropy | 4 | OPENAI、ANTHROPIC、NVDA、SNDK |
+| lighter_rh + arcus | 40 | 美股、BTC/ETH/SOL/HYPE、SUI、PONS、LIT 等；两边都有积分 |
+| entropy + arcus | 4 | DRAM、NBIS、NVDA、SNDK |
+| lighter + arcus | 60 | 服务器 A，价差太小，不再推荐 |
+
+一个 `monitor` 进程就能同时看全部 6 组（只读行情，不下单，不需要私钥）：
+
+```bash
+.venv/bin/python -m arb --config config/config.yaml monitor          # 放在 tmux 里跑 2~3 天；数据在 data/monitor/
+.venv/bin/python -m arb --config config/config.yaml rank --pair lighter+entropy --top 20
+.venv/bin/python -m arb --config config/config.yaml rank --pair lighter_rh+arcus --top 20
+```
+
+采样大约 1 GB/天（`data/monitor/spread_samples/`），注意磁盘。
+
 ## v5.6.1：清理结果以成交为准 / 只剩一边的小残仓也清理 / 门槛调整建议（只建议，不改参数）
 
 **1. 小残仓清理后的持仓以成交结果为准**：v5.6 平完残仓后立刻查交易所持仓，查到的有时还是旧数据
@@ -205,7 +265,7 @@ python -m arb tune --config config/xxx.yaml --hours 48 --symbols ANTHROPIC,OPENA
 python -m arb tune --config config/xxx.yaml --log         # 机器人每小时写下的建议（只列变化），默认最近 24 小时
 ```
 
-`why_idle.py` 也会显示最新一次的调整建议和残仓清理的确认来源。第二阶段（自动按建议调整，每天最多 2 次）等建议跑 1~2 周、核对过准确度后再做。
+`why_idle.py` 也会显示最新一次的调整建议和残仓清理的确认来源。自动按建议调整见 v5.7（`autotune.mode: apply`）。
 
 ## v5.6：卡死的小残仓自动清理 / 残仓不再锁方向 / 没成交的信号写日志
 

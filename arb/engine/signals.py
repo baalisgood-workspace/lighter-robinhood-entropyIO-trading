@@ -119,6 +119,24 @@ def adverse_funding_pct(direction: str, rate_maker: Optional[float], rate_taker:
     return max(0.0, hourly) * hours * 100.0
 
 
+def funding_earned_hourly_pct(direction: str, rate_maker: Optional[float], rate_taker: Optional[float]) -> Optional[float]:
+    """v5.7 funding carry: net funding the hedged position of `direction` RECEIVES, percent per hour (negative =
+    it pays). None if a rate is unknown."""
+    if rate_maker is None or rate_taker is None:
+        return None
+    hourly = rate_maker - rate_taker if direction == SELL_MAKER else rate_taker - rate_maker
+    return hourly * 100.0
+
+
+def carry_need(need: float, earned_hourly: Optional[float], fees: float, min_hourly: float, credit_hours: float,
+               min_open: float) -> float:
+    """Open trigger with the funding-carry credit: lowered by the expected funding over credit_hours when the
+    position earns >= min_hourly, never below fees + min_open (and never raised)."""
+    if earned_hourly is None or earned_hourly < min_hourly:
+        return need
+    return min(need, max(need - earned_hourly * credit_hours, fees + min_open))
+
+
 @dataclass
 class Quote:
     direction: str
