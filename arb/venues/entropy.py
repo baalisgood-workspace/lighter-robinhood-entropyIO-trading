@@ -64,6 +64,9 @@ def map_hl_status(raw: str) -> OrderStatus:
     return OrderStatus.UNKNOWN
 
 
+UNIFIED_MODES = ("unifiedAccount", "portfolioMargin")
+
+
 class EntropyVenue(Venue):
     def __init__(self, cfg, env=None):
         super().__init__(cfg, env)
@@ -77,6 +80,8 @@ class EntropyVenue(Venue):
         self._running = False
         self._by_oid: dict[int, str] = {}  # oid -> client_id (cloid raw)
         self._fills: dict[int, dict[int, tuple[Decimal, Decimal]]] = {}  # oid -> tid -> (sz, px)
+        self._collateral_token = 0  # dex collateral (0 = USDC), from meta
+        self._dex_empty_warned = False
 
     @property
     def account_id(self) -> str:
@@ -150,6 +155,7 @@ class EntropyVenue(Venue):
 
     async def _load_markets(self, symbols: list[str]) -> None:
         meta = await self._info({"type": "meta", "dex": self.dex})
+        self._collateral_token = int(meta.get("collateralToken") or 0)
         universe = {u["name"]: u for u in meta.get("universe", [])}
         for sym in symbols:
             u = universe.get(sym)
@@ -192,9 +198,24 @@ class EntropyVenue(Venue):
         return out
 
     async def balance(self) -> Balance:
+        """v5.7.3: unified / portfolio margin accounts keep all balances and holds in the spot clearinghouse state;
+        the per-dex state is not meaningful there (Hyperliquid docs: account abstraction modes). Other modes
+        have a separate balance per dex. An unreadable mode raises: never report funds we could not verify."""
+        mode = await self._info({"type": "userAbstraction", "user": self.address})
         st = await self._info({"type": "clearinghouseState", "user": self.address, "dex": self.dex}, cost=2)
+        if mode in UNIFIED_MODES:
+            spot = await self._info({"type": "spotClearinghouseState", "user": self.address}, cost=2)
+            row = next((b for b in spot.get("balances") or [] if b.get("token") == self._collateral_token), None) or {}
+            total, hold = D(row.get("total") or 0), D(row.get("hold") or 0)
+            upnl = sum((D((ap.get("position") or {}).get("unrealizedPnl") or 0) for ap in st.get("assetPositions") or []), D(0))
+            return Balance(self.name, equity=total + upnl, available=max(D(0), total - hold))
         ms = st.get("marginSummary") or {}
-        return Balance(self.name, equity=D(ms.get("accountValue") or 0), available=D(st.get("withdrawable") or 0))
+        equity = D(ms.get("accountValue") or 0)
+        if equity == 0 and not self._dex_empty_warned:
+            self._dex_empty_warned = True
+            log.warning("entropy: account mode %s keeps a separate balance per dex and dex %s holds 0: transfer USDC to it "
+                        "(sendAsset) or switch the account to unified mode", mode, self.dex)
+        return Balance(self.name, equity=equity, available=D(st.get("withdrawable") or 0))
 
     # ------------------------------------------------------------ rounding
     def round_price(self, symbol: str, price: Decimal, up: bool) -> Decimal:
