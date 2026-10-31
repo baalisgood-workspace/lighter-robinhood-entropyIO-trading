@@ -1,0 +1,83 @@
+# v5.7.2 小额实盘试跑：Entropy (maker) <-> Lighter 主账户 (taker)，只交易 3 个标的。
+# 启动：.venv/bin/python -m arb --config config/lighter_entropy.yaml live
+# 第一阶段单笔很小，只为验证 Entropy 下单、对冲、平仓整条链路；确认正常后再把 order/grid 调到 100/200。
+venues:
+  lighter:
+    enabled: true
+    maker_fee_pct: 0.0
+    taker_fee_pct: 0.0
+    requests_per_minute: 60
+  lighter_rh:
+    enabled: false
+  entropy:
+    enabled: true
+    dex: io
+    maker_fee_pct: 0.003         # growth mode (OAI/ANTH/SNDK 2026-10-31 仍开启)。结束后基础费率 0.03 / 0.09，这里要同步改
+    taker_fee_pct: 0.009
+    leverage: 3                  # 逐仓
+    requests_per_minute: 300
+  arcus:
+    enabled: false
+
+market_data:
+  watch_all_venues: false
+
+trading:
+  close_only: false
+  allow_preexisting_positions: false   # 这 3 个标的账户里已有仓位时拒绝启动
+  max_parallel_slices: 1
+
+guards:
+  slippage_pause_pct: 0.08
+  slippage_pause_s: 900
+  slippage_burst_count: 5
+  slippage_burst_window_s: 180
+  slippage_pause_scope: symbol
+  hedge_latency_max_s: 3.2
+  hedge_latency_pause_s: 1000
+
+auto_symbols:
+  enabled: false
+
+autotune:
+  mode: advise                   # 试跑阶段只给建议，不自动改门槛
+
+defaults:
+  strategy:
+    initial_threshold_pct: 0.10
+    grid_step_pct: 0.10
+    max_grids: 1
+    first_close_ratio: 0.5
+    grid_value_usdc: 60
+    order_value_usdc: 30
+    min_close_profit_pct: 0.03
+    close_floor_timeout_s: 1800
+    signal_confirm_s: 2
+  execution:
+    maker_price_mode: join
+    maker_timeout_s: 20
+    hedge_slippage_pct: 0.05
+    hedge_max_attempts: 4
+    hedge_min_notional_usdc: 10
+    close_mode: maker_taker
+    open_mode: maker_taker
+    emergency_unwind: false      # 对冲失败：撤单、保留两边仓位、停机等人工处理
+  risk:
+    min_available_usdc: 100
+    max_symbol_value_usdc: 200
+    max_venue_notional_usdc: 500
+    max_leverage: 2
+    max_unhedged_notional_usdc: 60
+    auto_adopt_max_usdc: 0       # 仓位不一致直接停机，不自动认领
+    volatility_max_pct: 4.0
+
+symbols:
+  ANTHROPIC:
+    venues: {lighter: ANTHROPIC, entropy: "io:ANTH"}
+    strategy: {initial_threshold_pct: 0.08}
+  SNDK:
+    venues: {lighter: SNDK, entropy: "io:SNDK"}
+    strategy: {session: us_equity, initial_threshold_pct: 0.10, offhours_threshold_pct: 0.15}
+  OPENAI:
+    venues: {lighter: OPENAI, entropy: "io:OAI"}
+    strategy: {initial_threshold_pct: 0.15}
