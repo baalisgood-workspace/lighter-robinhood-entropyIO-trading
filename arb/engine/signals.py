@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 from arb.models import OrderBook
 
+EDGE_VERSION = 2  # v5.7.4 raw_edge base; journal rows and saved totals without it are inflated
 SELL_MAKER = "sell_maker"
 BUY_MAKER = "buy_maker"
 SHORT_MAKER = "short_maker"
@@ -90,9 +91,11 @@ def taker_fill(book: OrderBook, is_buy: bool, qty: Decimal, levels: int, band_pc
 
 
 def raw_edge(direction: str, maker_px: Decimal, taker_px: Decimal) -> float:
+    """Both directions over the taker price (same base as basis_value): with different bases an open + close at
+    an unchanged spread summed to about basis^2 of profit that does not exist (0.1 % at a 3.2 % basis)."""
     if direction == SELL_MAKER:
         return float((maker_px - taker_px) / taker_px * 100)
-    return float((taker_px - maker_px) / maker_px * 100)
+    return float((taker_px - maker_px) / taker_px * 100)
 
 
 def adjusted_edge(direction: str, raw: float, basis: float) -> float:

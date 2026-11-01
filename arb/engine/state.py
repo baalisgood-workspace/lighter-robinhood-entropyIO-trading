@@ -10,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-from arb.engine.signals import LONG_MAKER, SHORT_MAKER
+from arb.engine.signals import EDGE_VERSION, LONG_MAKER, SHORT_MAKER
 
 ZERO = Decimal("0")
 
@@ -165,6 +165,7 @@ class SymbolPosition:
     # -------------------------------------------------------------- json
     def to_json(self) -> dict:
         d = asdict(self)
+        d["edge_v"] = EDGE_VERSION
         d["residual_maker"] = str(self.residual_maker)
         d["residual_taker"] = str(self.residual_taker)
         d["grids"] = [{**asdict(g), "qty": str(g.qty), "target_qty": str(g.target_qty),
@@ -175,7 +176,7 @@ class SymbolPosition:
     def from_json(cls, d: dict) -> "SymbolPosition":
         sp = cls(pair_key=d["pair_key"], symbol=d["symbol"], direction=d.get("direction"),
                  residual_maker=Decimal(d.get("residual_maker", "0")), residual_taker=Decimal(d.get("residual_taker", "0")),
-                 realized_edge_usdc=float(d.get("realized_edge_usdc", 0.0)), updated=float(d.get("updated", time.time())),
+                 realized_edge_usdc=float(d.get("realized_edge_usdc", 0.0)) if d.get("edge_v") == EDGE_VERSION else 0.0, updated=float(d.get("updated", time.time())),
                  n_open=int(d.get("n_open", 0)), n_close=int(d.get("n_close", 0)))
         for g in d.get("grids", []):
             sp.grids.append(Grid(level=int(g["level"]), qty=Decimal(g["qty"]), target_qty=Decimal(g["target_qty"]),

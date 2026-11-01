@@ -183,6 +183,10 @@ def _risk_panel(eng: Engine):
     gross = sum(float(x.get("gross_pnl_usdc") or 0) for x in eng.trades if x.get("kind") == "close")
     t.append("策略毛利：", style="cyan")
     t.append(f"累计 {realized:+.2f} U（本次记录 {gross:+.2f} U，未扣手续费/资金费）\n")
+    if eng.balances:
+        t.append("账户实际变化：", style="cyan")
+        change = sum(float(b.equity) - eng.equity0.get(n, float(b.equity)) for n, b in eng.balances.items())
+        t.append(f"{change:+.2f} U（本次启动以来两所权益合计，已含手续费/资金费/持仓浮盈亏）\n")
     t.append("未对冲名义：", style="cyan")
     un = eng._unhedged_notional() if eng.active else 0.0
     t.append(f"{un:.2f} U\n", style="red" if un > 0 else None)

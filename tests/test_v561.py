@@ -187,7 +187,7 @@ def _closes(sym, n, bps, t1=0.12, spread=1.0, fee=0.0, old=False, bucket="all", 
     for i in range(n):
         b = bps + (spread if i % 2 else -spread)
         r = {"ts": now - 3600 + i, "kind": "close", "symbol": sym, "level": 1, "hedged": 1, "taker_avg": 100,
-             "gross_pnl_usdc": b / 1e4 * 100, "required": -t1 * 0.5}
+             "gross_pnl_usdc": b / 1e4 * 100, "required": -t1 * 0.5, "edge_v": 2}
         if not old:
             r.update(open_t1=t1, open_bucket=bucket, fee_pct=fee)
         out.append(r)

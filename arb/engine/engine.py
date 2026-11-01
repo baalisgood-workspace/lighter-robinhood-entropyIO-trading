@@ -1176,7 +1176,6 @@ class Engine:
                 g = sp.grids[-1]
                 od = g.open_dev or 0.0
                 px = float(res.taker_avg or 0)
-                sp.realized_edge_usdc += (od + (dev or 0.0)) / 100 * float(hedged) * px
                 left, wq, wr = hedged, 0.0, 0.0  # FIFO lots consumed by this close
                 for q, r, _ in g.lots:
                     if left <= 0:
@@ -1187,13 +1186,15 @@ class Engine:
                         wq, wr = wq + float(part), wr + float(part) * r
                 if wq > 0 and raw is not None:
                     pnl = (wr / wq + raw) / 100 * float(hedged) * px  # gross two-leg, before fees/funding
+                # v5.7.4: the raw capture; the dev sum also moves with the basis EMA between open and close
+                sp.realized_edge_usdc += pnl if pnl is not None else (od + (dev or 0.0)) / 100 * float(hedged) * px
             sp.reduce_close(hedged)
         self.positions.save()
         slip = self.guards.on_result(c, plan, res, dev)
         self.journal(plan.kind, symbol=c.sym.key, direction=plan.direction, level=plan.level, qty=plan.qty,
                      maker_filled=res.maker_filled, maker_avg=res.maker_avg, taker_filled=res.taker_filled,
                      taker_avg=res.taker_avg, hedged=hedged, carry_in=res.carry_in, raw_edge=raw, adj_edge=dev,
-                     required=plan.required_dev, floor=plan.required_raw, gross_pnl_usdc=pnl, note=res.note,
+                     required=plan.required_dev, floor=plan.required_raw, gross_pnl_usdc=pnl, edge_v=sg.EDGE_VERSION, note=res.note,
                      requotes=res.requotes, hedge_orders=res.hedge_orders, zero_fill_hedges=res.zero_fill_hedges,
                      unwound=res.maker_unwound, error=res.error or None, slippage=slip,
                      hedge_latency_s=round(max(res.hedge_latencies), 3) if res.hedge_latencies else None,

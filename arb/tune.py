@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from arb.config import AppConfig, SymbolConfig, us_regular_hours
+from arb.engine.signals import EDGE_VERSION
 
 EPS = 1e-6
 
@@ -100,6 +101,8 @@ def load_closes(cfg: AppConfig, events_path: Path, since_ts: float, fees: Option
             except ValueError:
                 continue
             if r.get("kind") != "close" or float(r.get("ts", 0)) < since_ts or r.get("gross_pnl_usdc") is None:
+                continue
+            if r.get("edge_v") != EDGE_VERSION:  # written before the v5.7.4 raw_edge fix: gross inflated
                 continue
             sc = cfg.symbols.get(r.get("symbol"))
             if sc is None:
