@@ -51,7 +51,10 @@ defaults:
     grid_value_usdc: 60
     order_value_usdc: 30
     min_close_profit_pct: 0.03
-    close_floor_timeout_s: 1800
+    # v5.8 等回本再平：48 小时内每笔都要相对开仓价赚 0.03% 才平；价差漂移冻结时，赚钱的单照样可以平
+    close_floor_timeout_s: 172800
+    frozen_close: true
+    stop_loss_pct: 3.0             # 极端止损：现在平仓会亏 3%（两腿合计、未算手续费）就直接平
     signal_confirm_s: 2
   execution:
     maker_price_mode: join
@@ -70,6 +73,7 @@ defaults:
     max_unhedged_notional_usdc: 300
     auto_adopt_max_usdc: 0       # 仓位不一致直接停机，不自动认领
     volatility_max_pct: 4.0
+    max_hold_hours: 24           # 只提醒：最老一格持仓超过 24 小时
 
 symbols:
   ANTHROPIC:

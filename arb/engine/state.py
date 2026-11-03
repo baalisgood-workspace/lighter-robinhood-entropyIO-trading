@@ -56,18 +56,25 @@ class Grid:
     def close_floor(self, qty: Decimal, now: float, timeout_s: float, min_profit_pct: float) -> Optional[float]:
         """Minimum RAW closing edge so that the young (< timeout) FIFO lots closed by `qty` earn
         >= min_profit_pct on both legs together (before fees). None when no young attributed lot."""
+        raw = self._lots_raw(qty, lambda ts: now - ts < timeout_s)
+        return None if raw is None else min_profit_pct - raw
+
+    def entry_raw(self, qty: Decimal) -> Optional[float]:
+        """v5.8: qty-weighted raw opening edge of the FIFO lots closed by `qty`, whatever their age (None if
+        unknown). Closing now at raw edge r earns entry_raw + r on both legs together (before fees)."""
+        return self._lots_raw(qty, lambda ts: True)
+
+    def _lots_raw(self, qty: Decimal, keep) -> Optional[float]:
         left, wq, wraw = qty, 0.0, 0.0
         for q, raw, ts in self.lots:
             if left <= 0:
                 break
             part = min(q, left)
             left -= part
-            if raw is not None and now - ts < timeout_s:
+            if raw is not None and keep(ts):
                 wq += float(part)
                 wraw += float(part) * raw
-        if wq <= 0:
-            return None
-        return min_profit_pct - wraw / wq
+        return wraw / wq if wq > 0 else None
 
     @property
     def open_dev(self) -> Optional[float]:

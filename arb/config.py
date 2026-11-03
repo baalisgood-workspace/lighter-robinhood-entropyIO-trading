@@ -92,6 +92,11 @@ class StrategyConfig:
     # realised raw spread of its opening fills + the closing quote >= min_close_profit_pct (before fees).
     min_close_profit_pct: Optional[float] = 0.01  # null disables the floor
     close_floor_timeout_s: float = 600.0
+    # v5.8 hold-to-profit guards. frozen_close: while the basis is not ready (drift / warmup) the grid may still
+    # close, but only when the close earns >= min_close_profit_pct (0 if null) against its opening fills.
+    # stop_loss_pct: close at any price once closing now would lose this much (raw two-leg %, before fees).
+    frozen_close: bool = False
+    stop_loss_pct: Optional[float] = None
     # signal persistence (lighter-rh spread_persistence_seconds): join/improve modes open only after the
     # edge stayed above the trigger continuously for this many seconds. 0 = immediately (previous behaviour)
     signal_confirm_s: float = 0.0
@@ -621,6 +626,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.execution: requote_threshold_pct>=0, max_order_age_s>0, max_requotes_per_s>0")
         if ex.hedge_max_orders < ex.hedge_max_attempts or ex.hedge_min_notional_usdc < 0:
             errs.append(f"{p}.execution: hedge_max_orders >= hedge_max_attempts, hedge_min_notional_usdc >= 0")
+        if st.stop_loss_pct is not None and st.stop_loss_pct <= 0:
+            errs.append(f"{p}.strategy.stop_loss_pct must be > 0 or null")
         if st.min_close_profit_pct is not None and st.close_floor_timeout_s < 0:
             errs.append(f"{p}.strategy: close_floor_timeout_s must be >= 0")
         if rk.dust_max_usdc < 0 or rk.dust_grace_s < 0 or rk.skip_log_s < 0 or rk.dust_residual_grace_s < 0:

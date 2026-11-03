@@ -26,6 +26,7 @@ from arb.venues.base import Venue
 
 log = logging.getLogger("arb.engine")
 ZERO = Decimal("0")
+FREE_DEV = -100.0  # v5.8: required_dev of closes gated only by the raw edge (frozen_close / stop loss)
 
 
 SAMPLE_COLS = ["ts", "pair", "maker", "taker", "symbol", "mid_maker", "mid_taker", "basis_now", "basis_ema", "basis_ready",
@@ -50,6 +51,8 @@ class Ctx:
     qty: Decimal = ZERO
     basis_value: float = 0.0
     ready: bool = False
+    raw_ok: bool = False  # v5.8: fresh two-venue data past the warmup (frozen_close works without the basis)
+    stop_hit: bool = False  # v5.8: the stop loss of the current grid was reported
     status: str = "waiting"
     disabled: str = ""
     cooldown_until: float = 0.0
@@ -702,6 +705,7 @@ class Engine:
         if c.ready and warm < rk.warmup_fresh_s:
             c.ready, reason = False, f"warmup {warm:.0f}/{rk.warmup_fresh_s:.0f}s fresh data"
         c.status = "ready" if c.ready else reason
+        c.raw_ok = warm >= rk.warmup_fresh_s and not c.claim_block
         if c.claim_block:
             c.status = f"skipped: {c.claim_block}"
 
@@ -789,7 +793,11 @@ class Engine:
 
     def decide(self, c: Ctx, now: float) -> Optional[ExecPlan]:
         c.next_open = c.next_close = None
-        if c.disabled or not c.ready or c.q_sell is None or c.q_buy is None:
+        if c.disabled or c.q_sell is None or c.q_buy is None:
+            return None
+        st = c.sym.strategy
+        frozen = not c.ready  # v5.8: the basis is not ready; only frozen_close / stop-loss closes may run
+        if frozen and not (c.raw_ok and (st.frozen_close or st.stop_loss_pct is not None) and self.position(c).grids):
             return None
         if now < c.paused_until:
             c.status = f"paused {c.paused_until - now:.0f}s" + (f": {c.pause_reason}" if c.pause_reason else "")
@@ -797,13 +805,14 @@ class Engine:
         if now < c.cooldown_until:
             return None
         M, T = self.venues[c.pair.maker], self.venues[c.pair.taker]
-        st, rk, ex = c.sym.strategy, c.sym.risk, c.sym.execution
+        rk, ex = c.sym.risk, c.sym.execution
         sp = self.position(c)
         t1 = effective_t1(st, now)
         min_qty = max(M.market(c.maker_sym).min_qty, T.market(c.taker_sym).min_qty)
         sp.merge_dust(min_qty)
         if not sp.grids:
             c.unclosable, c.unclosable_since = "", None
+            c.stop_hit = False
         lock = sp.direction if sp.grids else None  # v5.6: residual dust without grids does not lock a direction
         basis_fn = (lambda: c.basis.ema or 0.0) if c.basis else (lambda: 0.0)
         tt = ex.close_mode == "taker_taker"
@@ -852,6 +861,33 @@ class Engine:
             else:
                 q = sg.build_quote(cdir, mb, tb, qty, c.basis_value, ex.maker_price_mode if not thr else "join",
                                    M.price_tick_at(c.maker_sym, mb.mid), rk.depth_levels, rk.depth_band_pct, maker_as_taker=tt)
+            entry = top.entry_raw(qty) if q is not None and q.ok and qty >= min_qty else None
+            if entry is not None and st.stop_loss_pct is not None and -(entry + q.raw) >= st.stop_loss_pct:
+                # v5.8 stop loss: close at any spread (no close level, no profit floor, basis not needed)
+                if not c.stop_hit:
+                    c.stop_hit = True
+                    self.event(f"WARNING {c.sym.key}: stop loss, closing now loses {-(entry + q.raw):.3f}% "
+                               f">= {st.stop_loss_pct}%", logging.WARNING)
+                    self.journal("stop_loss", symbol=c.sym.key, loss_pct=round(-(entry + q.raw), 4), qty=qty)
+                c.status = "stop loss: closing"
+                # worst accepted raw edge: one more stop width (keeps threshold-mode prices bounded)
+                plan = ExecPlan("close", c.pair, c.sym, c.maker_sym, c.taker_sym, cdir, qty, top.level, FREE_DEV, basis_fn,
+                                taker_taker=tt, required_raw=q.raw - st.stop_loss_pct)
+                plan.carry_in = pend
+                return plan if self._stable(c) else None
+            if frozen:
+                # v5.8 frozen_close: no basis, so only a close that earns the floor against the opening fills
+                need = (st.min_close_profit_pct or 0.0) - entry if entry is not None else None
+                if st.frozen_close and need is not None and q.raw >= need:
+                    plan = ExecPlan("close", c.pair, c.sym, c.maker_sym, c.taker_sym, cdir, qty, top.level, FREE_DEV,
+                                    basis_fn, taker_taker=tt, required_raw=need)
+                    plan.carry_in = pend
+                    if self._stable(c):
+                        return plan
+                    c.status = "close signal, prices unstable"
+                elif need is not None:
+                    c.status += f" | holding: close when raw >= {need:.3f}% (now {q.raw:.3f}%)"
+                return None
             floor = None
             if q is not None and st.min_close_profit_pct is not None:
                 floor = top.close_floor(qty, now, st.close_floor_timeout_s, st.min_close_profit_pct)
