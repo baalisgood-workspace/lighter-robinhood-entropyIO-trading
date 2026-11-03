@@ -1,6 +1,6 @@
-# v5.7.6 缩回：Entropy (maker) <-> Lighter 主账户 (taker)，只交易 3 个标的。
+# v5.8：Entropy (maker) <-> Lighter 主账户 (taker)，只交易 3 个标的。
 # 启动：.venv/bin/python -m arb --config config/lighter_entropy.yaml live
-# 11-03：Entropy 与 Lighter 的 ANTHROPIC 价差一天摆动 2-3% 并整体漂移（OPENAI 约 1%），单笔 250U 亏约 18U，缩回小额。SNDK 是上市股票，价差稳定，保持。
+# 单笔恢复 v5.7.5（ANTHROPIC 250U、OPENAI 140U、SNDK 300U）；价差漂移的风险靠下面的等回本再平和 3% 止损控制。
 venues:
   lighter:
     enabled: true
@@ -68,7 +68,7 @@ defaults:
   risk:
     min_available_usdc: 500
     max_symbol_value_usdc: 200
-    max_venue_notional_usdc: 10000   # 约 2 倍权益；实际持仓由下面每个标的的上限决定（全满 900U，约 0.2 倍）
+    max_venue_notional_usdc: 10000   # 约 2 倍权益；实际持仓由下面每个标的的上限决定（全满 1900U，约 0.4 倍）
     max_leverage: 2
     max_unhedged_notional_usdc: 300
     auto_adopt_max_usdc: 0       # 仓位不一致直接停机，不自动认领
@@ -78,13 +78,13 @@ defaults:
 symbols:
   ANTHROPIC:
     venues: {lighter: ANTHROPIC, entropy: "io:ANTH"}
-    strategy: {initial_threshold_pct: 0.08, grid_value_usdc: 100, order_value_usdc: 50, max_grids: 2}
-    risk: {max_symbol_value_usdc: 200}
+    strategy: {initial_threshold_pct: 0.08, grid_value_usdc: 500, order_value_usdc: 250, max_grids: 2}
+    risk: {max_symbol_value_usdc: 1000}
   SNDK:
     venues: {lighter: SNDK, entropy: "io:SNDK"}
     strategy: {session: us_equity, initial_threshold_pct: 0.10, offhours_threshold_pct: 0.15, grid_value_usdc: 600, order_value_usdc: 300}
     risk: {max_symbol_value_usdc: 600}
   OPENAI:
     venues: {lighter: OPENAI, entropy: "io:OAI"}
-    strategy: {initial_threshold_pct: 0.15, grid_value_usdc: 100, order_value_usdc: 50}
-    risk: {max_symbol_value_usdc: 100}
+    strategy: {initial_threshold_pct: 0.15, grid_value_usdc: 300, order_value_usdc: 140}
+    risk: {max_symbol_value_usdc: 300}
