@@ -105,3 +105,36 @@ def test_lighter_entropy_config_loads():
     st = cfg.symbols["ANTHROPIC"].strategy
     assert st.frozen_close and st.stop_loss_pct is None and st.close_floor_timeout_s >= 365 * 86400
     assert cfg.symbols["ANTHROPIC"].close_only and not cfg.symbols["SNDK"].close_only
+    assert cfg.symbols["SNDK"].risk.min_liq_distance_pct == 15
+
+
+# ------------------------------------------------------------------ v5.8.5 margin guard
+def test_liq_price_parsing():
+    from arb.models import liq_price
+    assert liq_price("1650.5") == D("1650.5")
+    assert liq_price(None) is None and liq_price("") is None and liq_price("0") is None and liq_price("-1") is None
+
+
+def test_near_liquidation_blocks_opens_and_warns(tmp_path, fake_pair):
+    from arb.models import Position
+    M, T = fake_pair  # maker mid 100.95, taker mid 99.95
+    eng, c = make_engine(tmp_path, fake_pair, risk={"min_liq_distance_pct": 15})
+    now = time.time()
+    eng.exch_positions = {"lighter_rh": {"X": Position("lighter_rh", "X", D("-1"), D("100"), D("130"))},
+                          "lighter": {"X": Position("lighter", "X", D("1"), D("100"), D("70"))}}
+    eng.compute(c, now)
+    assert eng.decide(c, now).kind == "open"  # ~29-30% away: fine
+    eng.exch_positions["lighter_rh"]["X"] = Position("lighter_rh", "X", D("-1"), D("100"), D("110"))  # ~9% away
+    eng.compute(c, now)
+    assert eng.decide(c, now) is None and "距强平" in c.warn
+    ev = [json.loads(x) for x in eng.journal_path.read_text().splitlines()]
+    assert any(e["kind"] == "warning" and e["key"].startswith("liq:") for e in ev)
+
+
+def test_margin_guard_off_by_default(tmp_path, fake_pair):
+    from arb.models import Position
+    eng, c = make_engine(tmp_path, fake_pair)
+    now = time.time()
+    eng.exch_positions = {"lighter_rh": {"X": Position("lighter_rh", "X", D("-1"), D("100"), D("101.5"))}}
+    eng.compute(c, now)
+    assert eng.decide(c, now).kind == "open"

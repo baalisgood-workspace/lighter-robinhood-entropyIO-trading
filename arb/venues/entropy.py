@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import aiohttp
 
-from arb.models import Balance, Level, MarketInfo, OrderBook, OrderState, OrderStatus, Position
+from arb.models import Balance, Level, MarketInfo, OrderBook, OrderState, OrderStatus, Position, liq_price
 from arb.util import D, RateLimiter, new_client_index
 from arb.venues.base import Venue, VenueError
 from arb.venues.transport import harden_requests_session, http_session, ws_connect
@@ -194,7 +194,8 @@ class EntropyVenue(Venue):
             p = ap.get("position") or {}
             sym = p.get("coin")
             if sym in self.markets:
-                out[sym] = Position(self.name, sym, D(p.get("szi") or 0), D(p["entryPx"]) if p.get("entryPx") else None)
+                out[sym] = Position(self.name, sym, D(p.get("szi") or 0), D(p["entryPx"]) if p.get("entryPx") else None,
+                                    liq_price(p.get("liquidationPx")))
         return out
 
     async def balance(self) -> Balance:

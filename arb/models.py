@@ -119,6 +119,16 @@ class Position:
     symbol: str
     qty: Decimal  # signed, + long / - short
     entry_price: Optional[Decimal] = None
+    liq_price: Optional[Decimal] = None  # v5.8.5: exchange liquidation price (None = unknown / none)
+
+
+def liq_price(v) -> Optional[Decimal]:
+    """Exchange liquidation price field -> Decimal; missing, unparsable or <= 0 (no liquidation) -> None."""
+    try:
+        d = Decimal(str(v))
+    except Exception:  # noqa: BLE001
+        return None
+    return d if d.is_finite() and d > 0 else None
 
 
 @dataclass

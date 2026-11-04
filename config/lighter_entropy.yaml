@@ -75,6 +75,7 @@ defaults:
     auto_adopt_max_usdc: 0       # 仓位不一致直接停机，不自动认领
     volatility_max_pct: 4.0
     max_hold_hours: 24           # 只提醒：最老一格持仓超过 24 小时
+    min_liq_distance_pct: 15     # 任一仓位离强平价不到 15% 就停止开仓并报警（不平仓），需要手动补保证金
 
 symbols:
   ANTHROPIC:

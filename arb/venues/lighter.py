@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import aiohttp
 
-from arb.models import Balance, Level, MarketInfo, OrderBook, OrderState, OrderStatus, Position
+from arb.models import Balance, Level, MarketInfo, OrderBook, OrderState, OrderStatus, Position, liq_price
 from arb.util import D, RateLimiter, new_client_index
 from arb.venues.base import Venue, VenueError
 from arb.venues.transport import harden_foreign_session, http_session, ws_connect
@@ -321,7 +321,8 @@ class LighterVenue(Venue):
             if sym is None:
                 continue
             qty = D(p.get("position") or 0) * (1 if int(p.get("sign", 1)) >= 0 else -1)
-            out[sym] = Position(self.name, sym, qty, D(p["avg_entry_price"]) if p.get("avg_entry_price") else None)
+            out[sym] = Position(self.name, sym, qty, D(p["avg_entry_price"]) if p.get("avg_entry_price") else None,
+                                liq_price(p.get("liquidation_price")))
         return out
 
     async def balance(self) -> Balance:

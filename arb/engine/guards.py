@@ -157,7 +157,29 @@ class Guards:
                 self._warned.discard(f"fund:{c.key}")
         else:
             c.adverse_since = None
+        dist = self.liq_distance(c) if rk.min_liq_distance_pct is not None else None
+        if dist is not None and dist[0] < rk.min_liq_distance_pct:
+            warns.append(f"距强平{dist[0]:.1f}%")
+            self._warn_once(f"liq:{c.key}", f"{c.sym.key} {dist[1]} 距强平价只剩 {dist[0]:.1f}% "
+                                            f"(< {rk.min_liq_distance_pct:g}%)：已停止开仓，请补保证金")
+        else:
+            self._warned.discard(f"liq:{c.key}")
         c.warn = " ".join(warns)
+
+    def liq_distance(self, c: "Ctx") -> Optional[tuple[float, str]]:
+        """v5.8.5: (smallest distance in % of the mid between a position's mid and its liquidation price, "venue
+        symbol") over ALL positions with a known liquidation price (last reconcile) on the two venues of this
+        symbol - a stressed cross-margin account blocks every symbol on it. None if none is known."""
+        best = None
+        for vname in (c.pair.maker, c.pair.taker):
+            for sym, pos in self.eng.exch_positions.get(vname, {}).items():
+                b = self.eng.venues[vname].book(sym)
+                if pos.qty == 0 or pos.liq_price is None or not (b and b.mid):
+                    continue
+                d = float(abs(b.mid - pos.liq_price) / b.mid * 100)
+                if best is None or d < best[0]:
+                    best = (d, f"{vname} {sym}")
+        return best
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key in self._warned:
@@ -180,6 +202,10 @@ class Guards:
             return "美股盘外不开仓"
         if now < c.vol_block_until:
             return f"波动 {c.vol_amp:.1f}% 禁开 {c.vol_block_until - now:.0f}s"
+        if rk.min_liq_distance_pct is not None:
+            dist = self.liq_distance(c)
+            if dist is not None and dist[0] < rk.min_liq_distance_pct:
+                return f"{dist[1]} 距强平 {dist[0]:.1f}% < {rk.min_liq_distance_pct:g}%"
         if now < c.ro_block_until:
             return f"交易所只减仓 {c.ro_block_until - now:.0f}s"
         if rk.max_daily_opens is not None:

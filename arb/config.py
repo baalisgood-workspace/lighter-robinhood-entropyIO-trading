@@ -191,6 +191,9 @@ class RiskConfig:
     max_daily_opens: Optional[int] = None  # open slices per UTC day per symbol
     reduce_only_block_s: float = 1800.0  # venue rejected an opening order with "reduce only": block opens this long
     max_hold_hours: Optional[float] = None  # warn (UI/event) when the oldest grid is older than this
+    # v5.8.5 margin guard: a leg of this symbol whose exchange liquidation price is closer than this (percent of
+    # the mid) blocks new opens on the symbol and raises a warning (add margin by hand). null = off
+    min_liq_distance_pct: Optional[float] = None
     # ---- v5.2 auto-align (opt-in): a reconcile mismatch on ONE leg only (the other leg matches local state),
     # identical on two consecutive checks and worth at most this much, is adopted as residual (then settled
     # like any residual) instead of halting. 0 = off (always halt, as before). Capped per symbol per hour.
@@ -626,6 +629,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.execution: requote_threshold_pct>=0, max_order_age_s>0, max_requotes_per_s>0")
         if ex.hedge_max_orders < ex.hedge_max_attempts or ex.hedge_min_notional_usdc < 0:
             errs.append(f"{p}.execution: hedge_max_orders >= hedge_max_attempts, hedge_min_notional_usdc >= 0")
+        if rk.min_liq_distance_pct is not None and rk.min_liq_distance_pct <= 0:
+            errs.append(f"{p}.risk.min_liq_distance_pct must be > 0 or null")
         if st.stop_loss_pct is not None and st.stop_loss_pct <= 0:
             errs.append(f"{p}.strategy.stop_loss_pct must be > 0 or null")
         if st.min_close_profit_pct is not None and st.close_floor_timeout_s < 0:
