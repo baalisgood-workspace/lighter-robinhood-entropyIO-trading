@@ -103,4 +103,5 @@ def test_lighter_entropy_config_loads():
     from arb.config import load_config
     cfg = load_config(Path(__file__).resolve().parents[1] / "config" / "lighter_entropy.yaml")
     st = cfg.symbols["ANTHROPIC"].strategy
-    assert st.frozen_close and st.stop_loss_pct == 3.0 and st.close_floor_timeout_s == 172800
+    assert st.frozen_close and st.stop_loss_pct is None and st.close_floor_timeout_s >= 365 * 86400
+    assert not cfg.symbols["ANTHROPIC"].close_only

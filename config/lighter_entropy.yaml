@@ -1,6 +1,6 @@
 # v5.8：Entropy (maker) <-> Lighter 主账户 (taker)，只交易 3 个标的。
 # 启动：.venv/bin/python -m arb --config config/lighter_entropy.yaml live
-# 单笔恢复 v5.7.5（ANTHROPIC 250U、OPENAI 140U、SNDK 300U）；价差漂移的风险靠下面的等回本再平和 3% 止损控制。
+# 单笔 v5.7.5（ANTHROPIC 250U、OPENAI 140U、SNDK 300U）。v5.8.3：不止损，价差不回到开仓价之上就一直持仓。
 venues:
   lighter:
     enabled: true
@@ -51,10 +51,11 @@ defaults:
     grid_value_usdc: 60
     order_value_usdc: 30
     min_close_profit_pct: 0.03
-    # v5.8 等回本再平：48 小时内每笔都要相对开仓价赚 0.03% 才平；价差漂移冻结时，赚钱的单照样可以平
-    close_floor_timeout_s: 172800
+    # v5.8.3 只赚不亏：每笔都要相对开仓价赚 0.03% 才平，没有时间限制（1 年），也不止损。
+    # 价差漂移冻结时，赚钱的单照样可以平。代价：被套时仓位一直占着单币上限，这个币不再开新仓
+    close_floor_timeout_s: 31536000
     frozen_close: true
-    stop_loss_pct: 3.0             # 极端止损：现在平仓会亏 3%（两腿合计、未算手续费）就直接平
+    stop_loss_pct: null
     signal_confirm_s: 2
   execution:
     maker_price_mode: join
@@ -77,7 +78,6 @@ defaults:
 
 symbols:
   ANTHROPIC:
-    close_only: true             # 11-04：价差 1 小时内 5.4% -> 8.7%，3% 止损亏 34U；只平不开
     venues: {lighter: ANTHROPIC, entropy: "io:ANTH"}
     strategy: {initial_threshold_pct: 0.08, grid_value_usdc: 500, order_value_usdc: 250, max_grids: 2}
     risk: {max_symbol_value_usdc: 1000}
