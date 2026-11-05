@@ -199,11 +199,21 @@ class Executor:
         remaining = T.round_qty(plan.taker_sym, qty)
         dust = qty - remaining
         zero = orders = stale = 0
-        # retry budget: only confirmed zero-filled terminal IOCs count; positive partials keep going
-        while remaining > 0 and zero < ex.hedge_max_attempts and orders < ex.hedge_max_orders:
+        base_worst = ex.hedge_slippage_pct + (ex.hedge_max_attempts - 1) * ex.hedge_slippage_step_pct
+        rescue_n = ex.hedge_rescue_attempts if ex.hedge_rescue_slippage_pct > base_worst else 0
+        # retry budget: only confirmed zero-filled terminal IOCs count; positive partials keep going.
+        # v5.8.6: then up to rescue_n more zero fills with slippage widening to hedge_rescue_slippage_pct
+        while remaining > 0 and zero < ex.hedge_max_attempts + rescue_n and orders < ex.hedge_max_orders + rescue_n:
+            k = zero - ex.hedge_max_attempts + 1  # rescue attempt number (<= 0: regular attempt)
+            if k <= 0:
+                slip = ex.hedge_slippage_pct + zero * ex.hedge_slippage_step_pct
+            else:
+                slip = base_worst + (ex.hedge_rescue_slippage_pct - base_worst) * k / rescue_n
+                res.events.append(f"hedge rescue {k}/{rescue_n}: slippage {slip:.3f}%")
             t0 = time.monotonic()
-            st = await self._ioc(T, plan.taker_sym, taker_buy, remaining, plan.reduce_only,
-                                 ex.hedge_slippage_pct + zero * ex.hedge_slippage_step_pct, plan.sym.risk.max_quote_age_s)
+            sent = time.time()
+            st = await self._ioc(T, plan.taker_sym, taker_buy, remaining, plan.reduce_only, slip,
+                                 plan.sym.risk.max_quote_age_s)
             if st is not None:
                 res.hedge_latencies.append(time.monotonic() - t0)
             if st is None:  # taker book stale: nothing was sent
@@ -232,7 +242,19 @@ class Executor:
             px = ref.mid if ref and ref.mid else st.price
             if remaining <= 0 or not self._tradable(T, plan.taker_sym, remaining, px):
                 break
+            if st.filled <= 0:
+                await self._await_book_after(T, plan.taker_sym, sent, ex.hedge_retry_wait_s)
         return remaining + dust
+
+    @staticmethod
+    async def _await_book_after(v: Venue, sym: str, ts: float, timeout: float) -> None:
+        """v5.8.6: wait (at most `timeout`) until the venue's book of `sym` was updated after `ts`."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            b = v.book(sym)
+            if b is not None and b.ts_local > ts:
+                return
+            await asyncio.sleep(0.02)
 
     async def _emergency_unwind(self, plan: ExecPlan, qty: Decimal, res: ExecResult) -> Decimal:
         """Flatten `qty` of the maker fill on the maker venue. Returns unresolved qty."""

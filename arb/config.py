@@ -147,6 +147,13 @@ class ExecutionConfig:
     hedge_slippage_step_pct: float = 0.05  # extra slippage per retry
     hedge_max_attempts: int = 4  # counts only confirmed ZERO-fill IOCs; partial fills do not use up the budget
     hedge_max_orders: int = 12  # hard cap of hedge IOCs per hedge call (partials included)
+    # v5.8.6 fast markets: after a zero-fill IOC wait (up to this long) for a taker book newer than that order
+    # before pricing the next one, so a falling book is not chased with a stale best price
+    hedge_retry_wait_s: float = 0.5
+    # v5.8.6 rescue: once hedge_max_attempts zero-fill IOCs are used up, up to hedge_rescue_attempts more with
+    # slippage widening to hedge_rescue_slippage_pct, before halting with an unhedged leg. 0 attempts = off
+    hedge_rescue_attempts: int = 3
+    hedge_rescue_slippage_pct: float = 1.0
     hedge_min_notional_usdc: float = 10.0  # accumulate partial maker fills until the hedge reaches this
     close_mode: str = "maker_taker"  # maker_taker | taker_taker
     # open_mode taker_taker: open with an IOC on the maker venue too (no resting order); the edge is priced
@@ -647,6 +654,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.execution: maker_timeout_s>0, hedge_max_attempts>=1, hedge_slippage_pct>0")
         if ex.hedge_slippage_pct + ex.hedge_slippage_step_pct * (ex.hedge_max_attempts - 1) > 2.0:
             errs.append(f"{p}.execution: worst-case hedge slippage above 2% is not allowed")
+        if ex.hedge_retry_wait_s < 0 or ex.hedge_rescue_attempts < 0 or not (0 < ex.hedge_rescue_slippage_pct <= 2.0):
+            errs.append(f"{p}.execution: hedge_retry_wait_s >= 0, hedge_rescue_attempts >= 0, 0 < hedge_rescue_slippage_pct <= 2")
         if rk.depth_levels < 1 or rk.depth_band_pct <= 0 or rk.max_quote_age_s <= 0:
             errs.append(f"{p}.risk: depth_levels>=1, depth_band_pct>0, max_quote_age_s>0")
     return errs

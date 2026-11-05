@@ -70,7 +70,7 @@ def test_zero_fill_budget_then_manual_intervention(fake_pair):
     M, T = fake_pair
     M.maker_fills = [(0.05, D("1"))]
     T.ioc_ratio = D("0")
-    r = run(M, T, plan(hedge_max_attempts=3))
+    r = run(M, T, plan(hedge_max_attempts=3, hedge_rescue_attempts=0))
     assert r.halted and "manual intervention" in r.error and r.zero_fill_hedges == 3
     assert not M.ioc_log  # no automatic unwind by default
 

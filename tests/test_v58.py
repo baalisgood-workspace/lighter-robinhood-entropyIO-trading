@@ -138,3 +138,57 @@ def test_margin_guard_off_by_default(tmp_path, fake_pair):
     eng.exch_positions = {"lighter_rh": {"X": Position("lighter_rh", "X", D("-1"), D("100"), D("101.5"))}}
     eng.compute(c, now)
     assert eng.decide(c, now).kind == "open"
+
+
+# ------------------------------------------------------------------ v5.8.6 hedging in a fast market
+def _hedge_plan(**ex):
+    from test_ported import plan
+    return plan(**ex)
+
+
+def test_rescue_hedges_with_wider_slippage(fake_pair):
+    """A taker book that ran away: the buy hedge only fills once its limit is 0.5% above the (stale) best ask."""
+    from test_ported import run
+    from arb.models import OrderState, OrderStatus
+    M, T = fake_pair  # maker sells at 101.00, hedge buys on the taker, ask 100.00
+    M.maker_fills = [(0.05, D("1"))]
+    real = T.place_ioc
+
+    async def ioc(symbol, is_buy, qty, limit, reduce_only):
+        if limit < D("100.50"):
+            st = OrderState("z", T.name, symbol, is_buy, qty, limit, post_only=False, reduce_only=reduce_only)
+            st.status = OrderStatus.CANCELED
+            T.ioc_log.append(st)
+            return st
+        return await real(symbol, is_buy, qty, limit, reduce_only)
+    T.place_ioc = ioc
+    r = run(M, T, _hedge_plan(hedge_max_attempts=4))
+    assert not r.halted and r.taker_filled == D("1")
+    assert r.zero_fill_hedges == 5 and any("rescue 2/3" in e for e in r.events)  # 4 regular + rescue 1 at ~0.47%
+    assert max(o.price for o in T.ioc_log) <= D("101.00")  # never beyond the 1% rescue cap
+
+
+def test_rescue_still_halts_when_nothing_fills(fake_pair):
+    from test_ported import run
+    M, T = fake_pair
+    M.maker_fills = [(0.05, D("1"))]
+    T.ioc_ratio = D("0")
+    r = run(M, T, _hedge_plan(hedge_max_attempts=4))
+    assert r.halted and r.zero_fill_hedges == 7 and "manual intervention" in r.error
+    worst = max(abs(o.price - D("100.00")) / D("100.00") * 100 for o in T.ioc_log)  # buy hedge vs ask 100.00
+    assert worst <= D("1.0") + D("0.01")
+
+
+def test_retry_waits_for_a_newer_book(fake_pair):
+    import asyncio
+    import time as _t
+    from arb.engine.executor import Executor
+    M, T = fake_pair
+    T.books["X"].ts_local = _t.time() - 5  # last update 5s ago
+    t0 = _t.monotonic()
+    asyncio.run(Executor._await_book_after(T, "X", _t.time(), 0.2))
+    assert 0.18 <= _t.monotonic() - t0 < 0.5  # waited, gave up at the timeout
+    T.books["X"].ts_local = _t.time() + 1
+    t0 = _t.monotonic()
+    asyncio.run(Executor._await_book_after(T, "X", _t.time(), 0.2))
+    assert _t.monotonic() - t0 < 0.05  # newer book: no wait
