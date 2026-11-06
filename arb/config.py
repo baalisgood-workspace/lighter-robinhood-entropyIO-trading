@@ -161,6 +161,9 @@ class ExecutionConfig:
     open_mode: str = "maker_taker"  # maker_taker | taker_taker
     order_poll_interval_s: float = 1.0  # REST fallback poll period when no push update arrives
     order_final_timeout_s: float = 8.0  # wait for final state after cancel / IOC
+    # v5.8.7: a maker order still open after its cancel is cancelled again (each round waits
+    # order_final_timeout_s; at least two rounds) until this many seconds have passed; only then the engine halts
+    cancel_confirm_s: float = 30.0
     cooldown_s: float = 1.0
     # If the hedge fails: false (default) = keep both legs as they are, cancel all makers and lock the
     # instance for manual intervention; true = first try to flatten the unhedged maker fill with IOC.
@@ -654,6 +657,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.execution: maker_timeout_s>0, hedge_max_attempts>=1, hedge_slippage_pct>0")
         if ex.hedge_slippage_pct + ex.hedge_slippage_step_pct * (ex.hedge_max_attempts - 1) > 2.0:
             errs.append(f"{p}.execution: worst-case hedge slippage above 2% is not allowed")
+        if ex.cancel_confirm_s < 0:
+            errs.append(f"{p}.execution.cancel_confirm_s must be >= 0")
         if ex.hedge_retry_wait_s < 0 or ex.hedge_rescue_attempts < 0 or not (0 < ex.hedge_rescue_slippage_pct <= 2.0):
             errs.append(f"{p}.execution: hedge_retry_wait_s >= 0, hedge_rescue_attempts >= 0, 0 < hedge_rescue_slippage_pct <= 2")
         if rk.depth_levels < 1 or rk.depth_band_pct <= 0 or rk.max_quote_age_s <= 0:

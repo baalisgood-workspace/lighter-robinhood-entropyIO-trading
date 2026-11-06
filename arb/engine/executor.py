@@ -372,7 +372,14 @@ class Executor:
                 seen_cost = cost_now
 
         async def finalize(o: OrderState) -> None:
-            if not o.status.final:
+            deadline = time.monotonic() + ex.cancel_confirm_s
+            rounds = 0
+            while not o.status.final:
+                rounds += 1
+                if rounds > 1:
+                    # v5.8.7: e.g. the first cancel failed because the venue had not reported the order's index yet
+                    log.warning("maker order %s on %s still %s after cancel - cancelling again (round %d)",
+                                o.client_id, M.name, o.status.value, rounds)
                 try:
                     await M.cancel(o)
                 except Exception as exc:  # noqa: BLE001
@@ -384,6 +391,8 @@ class Executor:
                     # longer (the venue resolves it as canceled when it never reached the book)
                     await M.wait_final(o, max(0.0, M.unacked_resolve_s() - (time.time() - o.created)),
                                        poll=max(3.0, ex.order_poll_interval_s))
+                if rounds >= 2 and time.monotonic() >= deadline:  # at least one repeated cancel, then the budget
+                    break
             absorb(o)
             if not o.status.final:
                 raise ExecutionHalt(f"maker order {o.client_id} on {M.name} not final after cancel ({o.status.value})")

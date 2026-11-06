@@ -192,3 +192,39 @@ def test_retry_waits_for_a_newer_book(fake_pair):
     t0 = _t.monotonic()
     asyncio.run(Executor._await_book_after(T, "X", _t.time(), 0.2))
     assert _t.monotonic() - t0 < 0.05  # newer book: no wait
+
+
+# ------------------------------------------------------------------ v5.8.7 cancel confirmation
+def _slow_cancel(M, ignore: int):
+    """The first `ignore` cancels do nothing (venue has not reported the order index yet)."""
+    real = M.cancel
+    calls = {"n": 0}
+    M.cfg.unknown_lookup_s = 0  # the fake never reports an exchange id: do not wait for the lookup
+
+    async def cancel(st):
+        calls["n"] += 1
+        if calls["n"] <= ignore:
+            raise RuntimeError("cannot cancel, exchange order index unknown")
+        await real(st)
+    M.cancel = cancel
+    return calls
+
+
+def test_cancel_is_retried_instead_of_halting(fake_pair):
+    from test_ported import run
+    M, T = fake_pair
+    M.maker_fills = []  # never fills: the slice ends with a cancel
+    calls = _slow_cancel(M, ignore=1)
+    r = run(M, T, _hedge_plan(maker_timeout_s=0.2, order_final_timeout_s=0.2, cancel_confirm_s=5))
+    assert not r.halted, r.error
+    assert calls["n"] == 2 and all(o.status.final for o in M.placed)
+
+
+def test_cancel_still_halts_after_the_budget(fake_pair):
+    from test_ported import run
+    M, T = fake_pair
+    M.maker_fills = []
+    calls = _slow_cancel(M, ignore=100)
+    r = run(M, T, _hedge_plan(maker_timeout_s=0.2, order_final_timeout_s=0.2, cancel_confirm_s=0.5))
+    assert r.halted and "not final after cancel" in r.error
+    assert calls["n"] >= 2  # re-cancelled before giving up (the halt cleanup may cancel again)
