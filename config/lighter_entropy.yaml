@@ -1,4 +1,4 @@
-# v5.8：Entropy (maker) <-> Lighter 主账户 (taker)，只交易 3 个标的。
+# v5.8.8：Entropy (maker) <-> Lighter 主账户 (taker)。v5.8.8 新增 4 只有正股价格锚的股票（NVDA / DRAM / NBIS / CRCL）。
 # 启动：.venv/bin/python -m arb --config config/lighter_entropy.yaml live
 # 单笔 v5.7.5（ANTHROPIC 250U、OPENAI 140U、SNDK 300U）。v5.8.3：不止损，价差不回到开仓价之上就一直持仓。
 venues:
@@ -24,7 +24,7 @@ market_data:
 
 trading:
   close_only: false
-  allow_preexisting_positions: false   # 这 3 个标的账户里已有仓位时拒绝启动
+  allow_preexisting_positions: false   # 这些标的账户里已有仓位时拒绝启动
   max_parallel_slices: 1
 
 guards:
@@ -91,3 +91,21 @@ symbols:
     venues: {lighter: OPENAI, entropy: "io:OAI"}
     strategy: {initial_threshold_pct: 0.15, grid_value_usdc: 300, order_value_usdc: 140}
     risk: {max_symbol_value_usdc: 300}
+  # v5.8.8：11-07 实测两边基差都在 ±0.05% 内，Entropy 盘口 ±0.1% 内各约 5k-35k U（growth mode 费率同 SNDK）；
+  # 先小额试跑，跑出数据后由自动调参建议门槛（autotune advise）
+  NVDA:
+    venues: {lighter: NVDA, entropy: "io:NVDA"}
+    strategy: {session: us_equity, initial_threshold_pct: 0.10, offhours_threshold_pct: 0.15, grid_value_usdc: 300, order_value_usdc: 150}
+    risk: {max_symbol_value_usdc: 300}
+  DRAM:
+    venues: {lighter: DRAM, entropy: "io:DRAM"}
+    strategy: {session: us_equity, initial_threshold_pct: 0.10, offhours_threshold_pct: 0.15, grid_value_usdc: 300, order_value_usdc: 150}
+    risk: {max_symbol_value_usdc: 300}
+  NBIS:
+    venues: {lighter: NBIS, entropy: "io:NBIS"}
+    strategy: {session: us_equity, initial_threshold_pct: 0.10, offhours_threshold_pct: 0.15, grid_value_usdc: 300, order_value_usdc: 150}
+    risk: {max_symbol_value_usdc: 300}
+  CRCL:
+    venues: {lighter: CRCL, entropy: "io:CRCL"}
+    strategy: {session: us_equity, initial_threshold_pct: 0.10, offhours_threshold_pct: 0.15, grid_value_usdc: 200, order_value_usdc: 100}
+    risk: {max_symbol_value_usdc: 200}

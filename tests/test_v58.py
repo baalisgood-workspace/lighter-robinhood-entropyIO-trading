@@ -106,6 +106,7 @@ def test_lighter_entropy_config_loads():
     assert st.frozen_close and st.stop_loss_pct is None and st.close_floor_timeout_s >= 365 * 86400
     assert cfg.symbols["ANTHROPIC"].close_only and not cfg.symbols["SNDK"].close_only
     assert cfg.symbols["SNDK"].risk.min_liq_distance_pct == 15
+    assert {"NVDA", "DRAM", "NBIS", "CRCL"} <= set(cfg.symbols)
 
 
 # ------------------------------------------------------------------ v5.8.5 margin guard
