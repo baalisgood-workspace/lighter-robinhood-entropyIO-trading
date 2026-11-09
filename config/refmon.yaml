@@ -1,0 +1,26 @@
+# v5.9 只读参考监控（不需要任何账户/密钥，不下单）
+# 记录：小所（Lighter / Lighter RH / Entropy / Arcus）和大所（Binance / OKX / Bybit / Hyperliquid / Aster / Ondo）
+# 共同上市的标的，每 interval_s 秒一条买一/卖一（小所另记 ±depth_band_pct 内的盘口深度）和资金费率。
+# 启动：.venv/bin/python -m arb refmon --refmon-config config/refmon.yaml
+# 分析：.venv/bin/python -m arb refrank --refmon-config config/refmon.yaml [--days 7] [--small lighter_rh] [--ref binance]
+small_venues: [lighter, lighter_rh, entropy, arcus]
+ref_venues: [binance, okx, bybit, hyperliquid, aster, ondo]
+interval_s: 5
+depth_band_pct: 0.1
+out_dir: data/refmon          # 每个 UTC 日一个 YYYY-MM-DD.csv.gz
+flush_s: 60
+include: []                   # 只记录这些标的，例如 [BTC, ETH, NVDA]；空 = 所有共同上市的
+exclude: []
+min_edge_pct: 0.02            # refrank：偏离超过 往返手续费 + 这个值 才算一次机会（相当于开仓门槛 T1）
+# 手续费（%），refrank 用来扣成本；默认普通账户费率，有更低等级就改这里
+fees:
+  lighter: {maker: 0, taker: 0}
+  lighter_rh: {maker: 0.012, taker: 0.035}   # B 的 RH 已是高级账户
+  entropy: {maker: 0.003, taker: 0.009}      # growth mode
+  arcus: {maker: 0, taker: 0.0225}
+  binance: {maker: 0.02, taker: 0.05}
+  okx: {maker: 0.02, taker: 0.05}
+  bybit: {maker: 0.02, taker: 0.055}
+  hyperliquid: {maker: 0.015, taker: 0.045}
+  aster: {maker: 0.01, taker: 0.035}
+  ondo: {maker: 0.01, taker: 0.025}

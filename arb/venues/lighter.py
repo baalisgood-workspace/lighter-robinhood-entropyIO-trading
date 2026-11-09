@@ -340,24 +340,34 @@ class LighterVenue(Venue):
             try:
                 async with ws_connect(self._public_url(), self.mark_alive, self.cfg.liveness_s, self.cfg.quick_resume_s) as ws:
                     self._public_ws = ws
-                    for mid in self._symbol_by_mid:
-                        await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{mid}"}))
-                        await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{mid}"}))
+                    if len(self._symbol_by_mid) > 40:
+                        # v5.9: many markets (monitor/refmon) trip "Too Many Websocket Messages": subscribe paced in
+                        # the background while this loop keeps reading (a blocked reader misses keepalive pongs)
+                        subs = asyncio.create_task(self._subscribe_paced(ws))
+                    else:
+                        subs = None
+                        for mid in self._symbol_by_mid:
+                            await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{mid}"}))
+                            await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{mid}"}))
                     self.on_connected()
                     backoff = 1.0
                     last_ping = time.monotonic()
-                    while self._running:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                        except asyncio.TimeoutError:
-                            raw = None
-                        if time.monotonic() - last_ping > 25:
-                            await ws.send('{"type":"ping"}')
-                            last_ping = time.monotonic()
-                        if raw is None:
-                            continue
-                        self.alive_ts = time.time()
-                        await self._on_public(ws, json.loads(raw))
+                    try:
+                        while self._running:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            except asyncio.TimeoutError:
+                                raw = None
+                            if time.monotonic() - last_ping > 25:
+                                await ws.send('{"type":"ping"}')
+                                last_ping = time.monotonic()
+                            if raw is None:
+                                continue
+                            self.alive_ts = time.time()
+                            await self._on_public(ws, json.loads(raw))
+                    finally:
+                        if subs is not None:
+                            subs.cancel()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -371,6 +381,16 @@ class LighterVenue(Venue):
             if self._running:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+    async def _subscribe_paced(self, ws) -> None:
+        # Lighter allows ~200 WS messages per minute per IP (shared with a live bot on the same server): about
+        # 100 subscriptions per minute. book_only (refmon) skips market_stats (funding) to halve the messages.
+        book_only = getattr(self, "book_only", False)
+        for mid in list(self._symbol_by_mid):
+            await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{mid}"}))
+            if not book_only:
+                await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{mid}"}))
+            await asyncio.sleep(0.6 if book_only else 1.2)
 
     async def _on_public(self, ws, m: dict) -> None:
         typ = m.get("type", "")

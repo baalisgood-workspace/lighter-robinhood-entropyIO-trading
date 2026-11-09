@@ -466,7 +466,34 @@ def main(argv: list[str] | None = None) -> int:
     rk.add_argument("--pair", help="only this pair, e.g. lighter+arcus")
     rk.add_argument("--top", type=int, default=30)
     rk.add_argument("--save", action="store_true", help="write data/rank.json (used by auto_symbols.trade: ranked)")
+    rm = sub.add_parser("refmon", help="v5.9 read-only reference monitor: small venues vs Binance/OKX/Bybit/... (no keys)")
+    rm.add_argument("--refmon-config", default="config/refmon.yaml")
+    rm.add_argument("--duration", type=float, default=None, help="stop after N seconds")
+    rr = sub.add_parser("refrank", help="v5.9 rank small-venue / reference-venue combinations from refmon data")
+    rr.add_argument("--refmon-config", default="config/refmon.yaml")
+    rr.add_argument("--days", type=int, default=None, help="only the newest N day files")
+    rr.add_argument("--top", type=int, default=40)
+    rr.add_argument("--small", help="only this small venue, e.g. lighter_rh")
+    rr.add_argument("--ref", help="only this reference venue, e.g. binance")
+    rr.add_argument("--symbols", help="comma list")
     args = ap.parse_args(argv)
+
+    if args.cmd in ("refmon", "refrank"):  # own config file, independent of config.yaml / credentials
+        from arb.refmon import load_refmon_config, print_rank as print_refrank, run_refmon
+        from arb.util import setup_logging
+        try:
+            rcfg = load_refmon_config(args.refmon_config)
+        except (ConfigError, FileNotFoundError) as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return 2
+        if args.cmd == "refrank":
+            return print_refrank(rcfg, args.days, args.top, args.small, args.ref,
+                                 args.symbols.split(",") if args.symbols else None)
+        setup_logging("logs/refmon", getattr(args, "log_level", "INFO"), console=True)  # not logs/: the bot rotates logs/arb.log
+        try:
+            return asyncio.run(run_refmon(rcfg, args.duration))
+        except KeyboardInterrupt:
+            return 130
 
     try:
         cfg = _load(args)

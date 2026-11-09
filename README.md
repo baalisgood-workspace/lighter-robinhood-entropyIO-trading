@@ -151,6 +151,27 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.9：`arb refmon` 大所参考监控（只读，不需要账户）/ `arb refrank` 选交易所
+
+独立进程，不影响正在跑的交易机器人。每 5 秒记录一次小所（Lighter / Lighter RH / Entropy / Arcus，公开 WebSocket 盘口）和大所
+（Binance / OKX / Bybit / Hyperliquid / Aster / Ondo Perps，每所一次公开 REST 全市场行情）共同上市标的的买一 / 卖一、
+小所 ±0.1% 盘口深度和资金费率，写到 `data/refmon/YYYY-MM-DD.csv.gz`（UTC 日，约 300MB/天）。
+
+```bash
+tmux new -s refmon
+.venv/bin/python -m arb refmon --refmon-config config/refmon.yaml           # Ctrl+B D 退出查看，后台继续记录
+.venv/bin/python -m arb refrank --refmon-config config/refmon.yaml --days 7  # 按每天可赚的偏离排序
+.venv/bin/python -m arb refrank --small lighter_rh --ref binance --top 20
+```
+
+- 标的名统一成基础代码（BTC、NVDA、OPENAI、1000PEPE ...）；Hyperliquid 的 kPEPE 记为 1000PEPE。中位价差超过 3% 的组合视为
+  合约单位不同（1000 倍、预上市股本口径不同），refrank 里跳过。
+- Hyperliquid 一次请求拿不到买一卖一，记录的是 impactPxs（按其冲击金额能成交的价格），比买一卖一保守。Hyperliquid / Ondo 不记挂单量。
+- refrank：按机器人的打法统计「小所挂单 + 大所吃单」相对 1 小时基差均线的偏离；偏离 ≥ 往返手续费 + `min_edge_pct` 算一次机会，
+  回到均线算结束。手续费在 `config/refmon.yaml` 的 `fees:` 里改成自己的等级。结果是上限：假设挂单都能成交。
+- Lighter 公开 WebSocket 每个 IP 每分钟约 200 条消息（与同机的交易机器人共用），refmon 订阅很多市场时按每分钟约 100 条放慢订阅，
+  订阅完一百多个市场需要几分钟。
+
 ## v5.7.1：`arb points` 积分统计（只读）
 
 Lighter on Robinhood Chain 的积分规则：**标准账户对标准账户的成交不给积分**（实时积分、周积分都不给），至少一方付了手续费
