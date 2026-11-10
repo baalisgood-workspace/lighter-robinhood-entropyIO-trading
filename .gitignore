@@ -10,3 +10,4 @@ logs/
 venv/
 .upgrade_backup/
 config/config.yaml.bak-*
+*.local.md
