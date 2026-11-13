@@ -164,6 +164,11 @@ class ExecutionConfig:
     # v5.8.7: a maker order still open after its cancel is cancelled again (each round waits
     # order_final_timeout_s; at least two rounds) until this many seconds have passed; only then the engine halts
     cancel_confirm_s: float = 30.0
+    # v5.9.1 venue outage: while the maker venue's API keeps failing (HTTP 5xx / timeouts) the order cannot be
+    # looked up or cancelled at all, so the wait above is extended up to this many seconds (counted from the first
+    # cancel) and the engine only halts if the order is still unresolved when the API answers again or the time
+    # is up. 0 = off (halt after cancel_confirm_s as before)
+    cancel_outage_wait_s: float = 300.0
     cooldown_s: float = 1.0
     # If the hedge fails: false (default) = keep both legs as they are, cancel all makers and lock the
     # instance for manual intervention; true = first try to flatten the unhedged maker fill with IOC.
@@ -659,6 +664,8 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"{p}.execution: worst-case hedge slippage above 2% is not allowed")
         if ex.cancel_confirm_s < 0:
             errs.append(f"{p}.execution.cancel_confirm_s must be >= 0")
+        if ex.cancel_outage_wait_s < 0:
+            errs.append(f"{p}.execution.cancel_outage_wait_s must be >= 0")
         if ex.hedge_retry_wait_s < 0 or ex.hedge_rescue_attempts < 0 or not (0 < ex.hedge_rescue_slippage_pct <= 2.0):
             errs.append(f"{p}.execution: hedge_retry_wait_s >= 0, hedge_rescue_attempts >= 0, 0 < hedge_rescue_slippage_pct <= 2")
         if rk.depth_levels < 1 or rk.depth_band_pct <= 0 or rk.max_quote_age_s <= 0:

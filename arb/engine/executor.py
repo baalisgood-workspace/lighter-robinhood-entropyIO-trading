@@ -120,6 +120,11 @@ class Executor:
         m = v.market(sym)
         return qty >= m.min_qty and qty * price >= m.min_notional and qty > 0
 
+    @staticmethod
+    def _api_failing(v: Venue, since: float) -> bool:
+        """v5.9.1: the venue recorded an API failure (HTTP 5xx, timeout, transport) at or after `since` (wall time)."""
+        return any(f[2] == "api_error" and f[1] >= since for f in list(v.failures))
+
     def _fresh(self, v: Venue, sym: str, max_age: float):
         b = v.book(sym)
         if b is None or not b.is_valid() or v.quote_age(sym) > max_age:
@@ -373,9 +378,12 @@ class Executor:
 
         async def finalize(o: OrderState) -> None:
             deadline = time.monotonic() + ex.cancel_confirm_s
+            outage_deadline = time.monotonic() + max(ex.cancel_confirm_s, ex.cancel_outage_wait_s)
+            outage = False
             rounds = 0
             while not o.status.final:
                 rounds += 1
+                round_start = time.time()
                 if rounds > 1:
                     # v5.8.7: e.g. the first cancel failed because the venue had not reported the order's index yet
                     log.warning("maker order %s on %s still %s after cancel - cancelling again (round %d)",
@@ -383,19 +391,37 @@ class Executor:
                 try:
                     await M.cancel(o)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("cancel failed: %s", exc)
+                    log.warning("cancel failed: %s", " ".join(str(exc).split())[:200])
                 # a replacement is only placed after the cancel reached a terminal state
-                await M.wait_final(o, ex.order_final_timeout_s, poll=ex.order_poll_interval_s)
+                await M.wait_final(o, ex.order_final_timeout_s,
+                                   poll=max(5.0, ex.order_poll_interval_s) if outage else ex.order_poll_interval_s)
                 if not o.status.final and not o.exchange_id:
                     # never confirmed by the exchange (no push, no REST row yet): keep looking it up a while
                     # longer (the venue resolves it as canceled when it never reached the book)
                     await M.wait_final(o, max(0.0, M.unacked_resolve_s() - (time.time() - o.created)),
                                        poll=max(3.0, ex.order_poll_interval_s))
                 if rounds >= 2 and time.monotonic() >= deadline:  # at least one repeated cancel, then the budget
+                    # v5.9.1: the venue's API failed during this round as well (outage: nothing can be looked up
+                    # or cancelled) - keep trying until it answers again instead of halting on an order that
+                    # most likely never reached the book
+                    if (not o.status.final and time.monotonic() < outage_deadline and not self.stop_flag()
+                            and self._api_failing(M, round_start)):
+                        if not outage:
+                            outage = True
+                            msg = (f"{M.name} API is failing (outage?): maker order {o.client_id} still {o.status.value}"
+                                   f" - waiting up to {ex.cancel_outage_wait_s:.0f}s for the venue before halting")
+                            log.warning(msg)
+                            res.events.append(msg)
+                        continue
                     break
             absorb(o)
             if not o.status.final:
                 raise ExecutionHalt(f"maker order {o.client_id} on {M.name} not final after cancel ({o.status.value})")
+            if outage:
+                msg = (f"{M.name} API is back: maker order {o.client_id} resolved as {o.status.value}"
+                       f" (filled {o.filled}) after {rounds} rounds")
+                log.warning(msg)
+                res.events.append(msg)
             M.forget(o)
 
         def ref_px() -> Decimal:
@@ -480,7 +506,14 @@ class Executor:
                             if left > 0:
                                 await M.wait_final(order, left, poll=max(3.0, ex.order_poll_interval_s))
                         if order.status in (OrderStatus.UNKNOWN, OrderStatus.PENDING):
-                            raise ExecutionHalt(f"maker order {order.client_id} on {M.name} outcome unknown")
+                            # v5.9.1: cancel / look it up until it is final (this also waits out a venue API
+                            # outage); it raises ExecutionHalt when the outcome stays unknown. A resolved order
+                            # is handled like a cancelled one: its fills are hedged and the slice ends.
+                            await finalize(order)
+                            await hedge_pending()
+                            order = None
+                            stop_reason = "maker order outcome was unknown"
+                            break
                     continue
 
                 got = await M.wait_order(order, min(ex.order_poll_interval_s, 0.2) if thr else ex.order_poll_interval_s)

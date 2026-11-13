@@ -163,5 +163,9 @@ def test_lost_maker_ack_is_looked_up_instead_of_halting():
 
 def test_lost_maker_ack_never_resolved_still_halts():
     M, T = _lost_pair(False)
-    r = run(M, T, plan(maker_timeout_s=3, order_final_timeout_s=0.1))
-    assert r.halted and "outcome unknown" in r.error
+
+    async def cancel(st):  # v5.9.1: an order the venue cannot find cannot be cancelled either
+        raise RuntimeError("cannot cancel, exchange order index unknown")
+    M.cancel = cancel
+    r = run(M, T, plan(maker_timeout_s=3, order_final_timeout_s=0.1, cancel_confirm_s=0.3))
+    assert r.halted and "not final after cancel (unknown)" in r.error
