@@ -87,6 +87,15 @@ class Venue(ABC):
         if len(self.alarms) < 1000:
             self.alarms.append({"ts": time.time(), "venue": self.name, "kind": kind, "symbol": symbol, "detail": detail[:200]})
 
+    # ------------------------------------------------------------ v5.9.4 action budget (entropy overrides)
+    def action_wait_s(self, now: Optional[float] = None) -> float:
+        """Seconds until the venue's action budget allows the next new order (0 = now). Cancels never wait."""
+        return 0.0
+
+    def action_budget_text(self) -> str:
+        """Dashboard warning while the action budget is low ("" = fine / not tracked)."""
+        return ""
+
     def note_failure(self, where: str, text: str) -> Optional[str]:
         """Record an API failure if it is a rate limit / nonce / transport problem (not a business rejection)."""
         kind = classify_failure(text)

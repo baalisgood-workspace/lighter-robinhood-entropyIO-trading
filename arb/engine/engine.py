@@ -548,6 +548,12 @@ class Engine:
                         continue
                     plan = self.decide(c, now)
                     if plan is not None:
+                        wait = self.venues[c.pair.maker].action_wait_s(now)
+                        if wait > 0:  # v5.9.4: maker venue action budget low - wait for the spacing
+                            if plan.kind == "open":
+                                self._skip(c, now, "action budget", plan.direction, None, plan.required_dev,
+                                           f"{c.pair.maker} 下单次数额度不足，{wait:.0f}s 后可再挂单")
+                            continue
                         self.inflight[c.key] = plan
                         self.exec_tasks[c.key] = asyncio.create_task(self._execute(c, plan))
             self._drain_alarms()

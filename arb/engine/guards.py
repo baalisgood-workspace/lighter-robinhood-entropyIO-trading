@@ -93,6 +93,11 @@ class Guards:
             v = self.eng.venues.get(n)
             if v is None:
                 continue
+            txt = v.action_budget_text()  # v5.9.4 dashboard warning while the action budget is low
+            if txt:
+                self.alerts[f"actions:{n}"] = txt
+            else:
+                self.alerts.pop(f"actions:{n}", None)
             seen = self._fail_seen.get(n, 0)
             for seq, ts, kind, detail in list(v.failures):
                 if seq <= seen:

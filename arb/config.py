@@ -72,6 +72,15 @@ class VenueConfig:
     # re-read every canceled maker order from REST after these delays (null: on for arcus, off for lighter)
     verify_cancel_rest: Optional[bool] = None
     verify_cancel_delays_s: list = field(default_factory=lambda: [2.0, 8.0])
+    # v5.9.4 entropy (Hyperliquid) per-address action budget: 10000 + 1 per USDC traded since the account was
+    # created (info `userRateLimit`); over it the exchange accepts one action every 10 s. Once no more than
+    # action_soft_reserve actions are left, new maker orders are spaced action_low_gap_s apart (over the budget:
+    # action_over_gap_s), so the bot slows down instead of being rejected. Cancels and hedges are never held back.
+    action_budget: bool = True
+    action_soft_reserve: int = 2000
+    action_low_gap_s: float = 10.0
+    action_over_gap_s: float = 11.0
+    action_refresh_s: float = 60.0
 
     @property
     def kind(self) -> str:
@@ -562,6 +571,9 @@ def validate(cfg: AppConfig) -> list[str]:
             errs.append(f"venues.{v.name}.fee_refresh_s must be >= 0")
         if v.kind in ("hyperliquid", "arcus") and (v.maker_fee_pct is None or v.taker_fee_pct is None):
             errs.append(f"venues.{v.name}: maker_fee_pct/taker_fee_pct are required")
+        if v.action_soft_reserve < 0 or v.action_low_gap_s <= 0 or v.action_over_gap_s < 10 or v.action_refresh_s < 10:
+            errs.append(f"venues.{v.name}: action_soft_reserve >= 0, action_low_gap_s > 0, action_over_gap_s >= 10 "
+                        "(the exchange allows one action per 10 s over the budget), action_refresh_s >= 10")
         if v.kind == "hyperliquid" and not (1 <= v.leverage <= 50):
             errs.append(f"venues.{v.name}.leverage must be 1..50")
     at = cfg.autotune

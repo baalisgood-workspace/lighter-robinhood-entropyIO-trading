@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any, Optional
@@ -31,6 +32,9 @@ log = logging.getLogger("arb.entropy")
 HL_MIN_NOTIONAL = Decimal("10")
 BOOK_DEPTH = 20
 NO_MATCH_HINT = "could not immediately match"
+# v5.9.4 address action budget rejection, e.g. "Too many cumulative requests sent (41192 > 41086) for cumulative
+# volume traded $31087.88. Place taker orders to free up 1 request per USDC traded."
+CUMULATIVE_RE = re.compile(r"cumulative requests sent \((\d+)\s*>\s*(\d+)\)", re.I)
 
 
 def hl_price_decimals(price: Decimal, sz_decimals: int) -> int:
@@ -82,6 +86,15 @@ class EntropyVenue(Venue):
         self._fills: dict[int, dict[int, tuple[Decimal, Decimal]]] = {}  # oid -> tid -> (sz, px)
         self._collateral_token = 0  # dex collateral (0 = USDC), from meta
         self._dex_empty_warned = False
+        # v5.9.4 action budget (Hyperliquid per-address limit): exchange numbers + actions sent since the last read
+        self._act_used: Optional[int] = None
+        self._act_cap: Optional[int] = None
+        self._act_vlm: Optional[float] = None
+        self._act_since = 0  # actions sent since the last userRateLimit read
+        self._act_last = 0.0  # wall time of the last new order (place) sent
+        self._act_mode = "ok"  # ok | low | over (logged on change)
+        self._act_last_log = 0.0
+        self._act_reject_log = 0.0
 
     @property
     def account_id(self) -> str:
@@ -105,6 +118,89 @@ class EntropyVenue(Venue):
         await self._poll_funding()
         self._tasks.append(asyncio.create_task(self._ws_loop(), name="entropy-ws"))
         self._tasks.append(asyncio.create_task(self._funding_loop(), name="entropy-funding"))
+        if trading and self.cfg.action_budget:
+            try:
+                await self.refresh_action_budget()
+            except Exception as exc:  # noqa: BLE001 - tracked again by the loop
+                log.warning("entropy: userRateLimit not readable at start: %s", exc)
+            self._tasks.append(asyncio.create_task(self._action_loop(), name="entropy-actions"))
+
+    # ------------------------------------------------------------ v5.9.4 action budget
+    async def refresh_action_budget(self) -> None:
+        d = await self._info({"type": "userRateLimit", "user": self.address})
+        used, cap = d.get("nRequestsUsed"), d.get("nRequestsCap")
+        if used is None or cap is None:
+            raise VenueError(f"userRateLimit without nRequestsUsed/nRequestsCap: {str(d)[:200]}")
+        self._act_used, self._act_cap, self._act_since = int(used), int(cap), 0
+        self._act_vlm = float(d.get("cumVlm") or 0)
+        self._log_action_mode()
+
+    async def _action_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(self.cfg.action_refresh_s)
+            try:
+                await self.refresh_action_budget()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("entropy userRateLimit: %s", exc)
+
+    def actions_left(self) -> Optional[int]:
+        if self._act_cap is None or self._act_used is None:
+            return None
+        return self._act_cap - self._act_used - self._act_since
+
+    def _note_action(self, new_order: bool) -> None:
+        self._act_since += 1
+        if new_order:
+            self._act_last = time.time()
+
+    def _note_budget_rejection(self, text: str) -> bool:
+        """The exchange refused an order for the address budget: take its numbers (no venue-wide backoff - the
+        spacing in action_wait_s already paces new orders at the rate the exchange still accepts)."""
+        m = CUMULATIVE_RE.search(text or "")
+        if not m:
+            return False
+        self._act_used, self._act_cap, self._act_since = int(m.group(1)), int(m.group(2)), 0
+        now = time.time()
+        if now - self._act_reject_log >= 300:
+            self._act_reject_log = now
+            log.warning("entropy: action budget used up (%s); new orders now one per %.0fs - trading volume (or a "
+                        "purchased budget) raises it", text[:160], self.cfg.action_over_gap_s)
+        self._log_action_mode()
+        return True
+
+    def _log_action_mode(self) -> None:
+        left = self.actions_left()
+        if left is None:
+            return
+        mode = "over" if left <= 0 else ("low" if left <= self.cfg.action_soft_reserve else "ok")
+        now = time.time()
+        if mode != self._act_mode or (mode != "ok" and now - self._act_last_log >= 600):
+            lvl = logging.INFO if mode == "ok" else logging.WARNING
+            log.log(lvl, "entropy action budget: %d left (used %d / cap %d, cumulative volume %.0f USDC) -> %s",
+                    left, self._act_cap - left, self._act_cap, self._act_vlm or 0.0,
+                    {"ok": "normal", "low": f"new orders spaced {self.cfg.action_low_gap_s:.0f}s apart",
+                     "over": f"over the budget, new orders one per {self.cfg.action_over_gap_s:.0f}s"}[mode])
+            self._act_mode, self._act_last_log = mode, now
+
+    def action_wait_s(self, now: Optional[float] = None) -> float:
+        if not self.cfg.action_budget:
+            return 0.0
+        left = self.actions_left()
+        if left is None or left > self.cfg.action_soft_reserve:
+            return 0.0
+        gap = self.cfg.action_low_gap_s if left > 0 else self.cfg.action_over_gap_s
+        return max(0.0, self._act_last + gap - (time.time() if now is None else now))
+
+    def action_budget_text(self) -> str:
+        left = self.actions_left()
+        if not self.cfg.action_budget or left is None or left > self.cfg.action_soft_reserve:
+            return ""
+        if left <= 0:
+            return (f"entropy 下单次数额度已用完（超出 {-left} 次），每 {self.cfg.action_over_gap_s:.0f} 秒最多挂一单；"
+                    f"成交越多额度越多")
+        return f"entropy 下单次数额度只剩 {left} 次，挂单间隔放慢到 {self.cfg.action_low_gap_s:.0f} 秒"
 
     def _build_exchange(self):
         from eth_account import Account
@@ -368,6 +464,7 @@ class EntropyVenue(Venue):
         st = OrderState(cloid.to_raw(), self.name, symbol, is_buy, qty, price, post_only=(tif == "Alo"), reduce_only=reduce_only)
         self._track(st)
         await self.limiter.acquire()
+        self._note_action(new_order=True)
         try:
             res = await asyncio.to_thread(self.exchange.order, symbol, is_buy, float(qty), float(price),
                                           {"limit": {"tif": tif}}, reduce_only, cloid)
@@ -378,8 +475,11 @@ class EntropyVenue(Venue):
             return st
         self._parse_status(st, res, ioc=(tif == "Ioc"))
         if st.status == OrderStatus.REJECTED:
-            self.note_failure("order", st.reason)
-            log.warning("entropy order rejected %s %s: %s", symbol, st.client_id, st.reason)
+            if self._note_budget_rejection(st.reason):
+                log.info("entropy order rejected %s %s (action budget): %s", symbol, st.client_id, st.reason[:120])
+            else:
+                self.note_failure("order", st.reason)
+                log.warning("entropy order rejected %s %s: %s", symbol, st.client_id, st.reason)
         return st
 
     async def place_post_only(self, symbol, is_buy, qty, price, reduce_only) -> OrderState:
@@ -427,6 +527,7 @@ class EntropyVenue(Venue):
             if st.status.final:
                 return
         await self.limiter.acquire()
+        self._note_action(new_order=False)
         if st.exchange_id:
             res = await asyncio.to_thread(self.exchange.cancel, st.symbol, int(st.exchange_id))
         else:
@@ -446,5 +547,6 @@ class EntropyVenue(Venue):
         for o in orders or []:
             if o.get("coin") in symbols:
                 await self.limiter.acquire()
+                self._note_action(new_order=False)
                 res = await asyncio.to_thread(self.exchange.cancel, o["coin"], int(o["oid"]))
                 log.info("entropy cancel_all %s/%s -> %s", o["coin"], o["oid"], res)

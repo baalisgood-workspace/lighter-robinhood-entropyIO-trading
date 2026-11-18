@@ -464,6 +464,15 @@ class Executor:
                     if self.stop_flag():
                         stop_reason = "stopping"
                         break
+                    # v5.9.4: the maker venue's action budget is low - new orders are spaced; a requote that would
+                    # have to wait ends the slice (the engine starts the next one when the venue allows it)
+                    budget_wait = M.action_wait_s()
+                    if budget_wait > 0:
+                        if budget_wait > 1.5:
+                            stop_reason = f"action budget: next order allowed in {budget_wait:.0f}s"
+                            break
+                        await asyncio.sleep(budget_wait)
+                        continue
                     if now >= deadline or (not thr and requotes > ex.max_requotes):
                         stop_reason = "timeout" if now >= deadline else "max requotes"
                         break

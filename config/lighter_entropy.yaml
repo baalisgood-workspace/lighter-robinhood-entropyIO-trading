@@ -16,6 +16,12 @@ venues:
     taker_fee_pct: 0.009
     leverage: 3                  # 逐仓
     requests_per_minute: 300
+    # v5.9.4 下单次数额度（Hyperliquid 按账户算：1 万次 + 每成交 1U 加 1 次；超了交易所每 10 秒只收一单）。
+    # 剩余 <= action_soft_reserve 次时新挂单间隔放慢到 action_low_gap_s 秒，超额后每 action_over_gap_s 秒一单。
+    # 撤单和对冲不受限制。
+    action_soft_reserve: 2000
+    action_low_gap_s: 10
+    action_over_gap_s: 11
   arcus:
     enabled: false
 
@@ -59,7 +65,10 @@ defaults:
     signal_confirm_s: 2
   execution:
     maker_price_mode: join
-    maker_timeout_s: 20
+    # v5.9.4 少挂撤单：挂单最多等 60 秒（原 20 秒），不在最优价时最快 5 秒才改一次价（原 1 秒）。
+    # 以前每天约 1400 次挂单只成交十几笔，Entropy 下单次数额度就是这样用光的
+    maker_timeout_s: 60
+    requote_min_interval_s: 5
     hedge_slippage_pct: 0.05
     hedge_max_attempts: 4
     hedge_min_notional_usdc: 10
