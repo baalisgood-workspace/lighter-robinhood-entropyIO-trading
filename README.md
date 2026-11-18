@@ -151,6 +151,37 @@ Entropy 条款限制部分地区（含美国、加拿大、欧盟等），请自
 
 Entropy 费率：基础 maker 0.030% / taker 0.090%，growth mode 标的为 1/10。若某标的不在 growth mode，请把 `venues.entropy` 费率改为 0.03 / 0.09（往返成本会显著上升，T1 也要相应调高）。
 
+## v5.9.3：参考监控升级（按币的真实手续费、大所报价时间和盘口深度）
+
+`arb refmon` 原来每个交易所只用一个手续费，大所也不记盘口深度，统计出来的机会偏多。这一版补上：
+
+- **按币取手续费**。交易所接口能查到的，按每个市场自己的费率：
+  - Arcus 区分加密币和股票类：加密币 0.015% / 0.045%，股票类 0 / 0.0225%。
+  - Entropy 看这个币有没有开 growth mode：开了是正常费率的 1/10（0.003% / 0.009%），没开是 0.03% / 0.09%（例如 PRL）。
+  - Ondo 用每个合约自己的费率，目前都是 0.02% / 0.05%。
+
+  其它交易所用 `config/refmon.yaml` 的 `fees:`，已按 2026-11-18 的基础档核对。股票类合约可以单独设置（`stock:`），例如 Aster 股票类是 0 / 0.0125%。个别币可以用 `fee_overrides` 强制指定。
+- **每天一个 `data/refmon/YYYY-MM-DD.meta.json`**：记下每个交易所、每个币实际用的手续费及其来源，还有分类（股票 / 加密 / 其它）和最小下单额。每 `meta_refresh_s`（1 小时）重新读一次，refrank 会用它扣手续费。
+- **大所报价时间**：`age_s` 列以前对大所一律写 0。现在 Binance / Aster / OKX 记“采样时间 − 交易所自己的报价时间”；Bybit / Hyperliquid / Ondo 的接口没有报价时间，留空。超过 10 秒的旧报价不参与统计。
+- **大所盘口深度**：只对 `ref_depth_symbols` 里的币（最多 40 个），每 `ref_depth_interval_s`（15 秒）查一次各大所的盘口，记中间价 ±0.1% 内的挂单金额。默认 12 个币 × 5 个大所（`ref_depth_venues`，不含 Hyperliquid：它和 Entropy 交易脚本共用同一个 IP 的请求限额），约每秒 4 次请求。
+- **OKX 资金费率**：以前没有，现在每 5 分钟一次请求查全部合约。
+- **refrank 新选项**：
+  - `--both-take`：两边都直接吃单，不假设挂单一定成交，是最保守的算法。
+  - `--min-depth 300`：两边盘口（有记录的）薄的一侧至少 300U 才算机会。
+  - 小所之间也互相比较，例如 lighter 对 arcus、entropy 对 lighter。
+
+```bash
+.venv/bin/python -m arb refrank --refmon-config config/refmon.yaml --days 3 --both-take --min-depth 300
+```
+
+仍然统计不到的：
+- 挂单能不能成交、成交后价格会不会马上变不利，只有真实交易记录才有。以前在 A 上实际跑 lighter+arcus，这一项就是亏的。
+- 下单延迟：Lighter 普通账户吃单约 300 毫秒。
+- 5 秒以内的价格变化。
+- Hyperliquid 的股票类市场（HIP-3）和 Var 交易所，都没接入。
+
+所以 refrank 的结果只能用来排顺序，不能当作能赚多少钱。
+
 ## v5.9.1：交易所接口故障时先等待，不立刻停机
 
 挂单提交或撤单时如果交易所接口整体故障（HTTP 5xx / 超时），订单状态既查不到也撤不了。以前 30 秒（`cancel_confirm_s`）

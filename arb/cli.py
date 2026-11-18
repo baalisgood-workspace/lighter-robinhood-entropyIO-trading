@@ -476,6 +476,10 @@ def main(argv: list[str] | None = None) -> int:
     rr.add_argument("--small", help="only this small venue, e.g. lighter_rh")
     rr.add_argument("--ref", help="only this reference venue, e.g. binance")
     rr.add_argument("--symbols", help="comma list")
+    rr.add_argument("--min-depth", type=float, default=0.0,
+                    help="v5.9.3: both books need this many USD within depth_band_pct (where recorded)")
+    rr.add_argument("--both-take", action="store_true",
+                    help="v5.9.3: both legs cross the spread (no maker-fill assumption; the honest lower figure)")
     args = ap.parse_args(argv)
 
     if args.cmd in ("refmon", "refrank"):  # own config file, independent of config.yaml / credentials
@@ -488,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.cmd == "refrank":
             return print_refrank(rcfg, args.days, args.top, args.small, args.ref,
-                                 args.symbols.split(",") if args.symbols else None)
+                                 args.symbols.split(",") if args.symbols else None, args.min_depth, args.both_take)
         setup_logging("logs/refmon", getattr(args, "log_level", "INFO"), console=True)  # not logs/: the bot rotates logs/arb.log
         try:
             return asyncio.run(run_refmon(rcfg, args.duration))

@@ -12,15 +12,28 @@ flush_s: 60
 include: []                   # 只记录这些标的，例如 [BTC, ETH, NVDA]；空 = 所有共同上市的
 exclude: []
 min_edge_pct: 0.02            # refrank：偏离超过 往返手续费 + 这个值 才算一次机会（相当于开仓门槛 T1）
-# 手续费（%），refrank 用来扣成本；默认普通账户费率，有更低等级就改这里
+# v5.9.3 大所盘口深度：只对这些标的每 ref_depth_interval_s 秒查一次各大所盘口（每个标的每个大所一次请求，
+# 最多 40 个；12 个 x 5 个大所 / 15 秒 ≈ 每秒 4 次请求）。空 = 不记录大所深度。
+ref_depth_symbols: [OPENAI, ANTHROPIC, NVDA, NBIS, SNDK, CRCL, PONS, XMR, LIT, ZEC, SUI, HYPE]
+ref_depth_interval_s: 15
+# 查深度的大所。不含 hyperliquid：A 的交易脚本也用 Hyperliquid 接口（Entropy），同一个 IP 共用请求限额；
+# Hyperliquid 的买一/卖一本来记的就是按其冲击金额成交的价格，已经比较保守。
+ref_depth_venues: [binance, okx, bybit, aster, ondo]
+meta_refresh_s: 3600          # 每小时重新读取各所费率 / 分类 / 最小下单额，写入 YYYY-MM-DD.meta.json
+# 手续费（%，基础档，2026-11-18 核对）。交易所接口能按市场给出费率的会自动用接口的值并记在 meta 文件里：
+#   Arcus 每个市场自己的费率（加密币 0.015/0.045，股票类 0/0.0225）；Entropy 按 growth mode（开启 = 1/10 费率）；
+#   Ondo 每个合约自己的费率。其它交易所用这里的数；stock: 是股票类合约的费率（交易所标为股票 / 美股列表里的标的）。
 fees:
-  lighter: {maker: 0, taker: 0}
+  lighter: {maker: 0, taker: 0}              # 普通账户 0 费率，但吃单有约 300 毫秒延迟
   lighter_rh: {maker: 0.012, taker: 0.035}   # B 的 RH 已是高级账户
-  entropy: {maker: 0.003, taker: 0.009}      # growth mode
-  arcus: {maker: 0, taker: 0.0225}
+  entropy: {maker: 0.03, taker: 0.09}        # 正常费率；growth mode 的市场自动 x0.1（= 0.003/0.009，已用 A 的真实成交核对）
+  arcus: {maker: 0.015, taker: 0.045, stock: {maker: 0, taker: 0.0225}}   # 接口读不到时才用
   binance: {maker: 0.02, taker: 0.05}
   okx: {maker: 0.02, taker: 0.05}
   bybit: {maker: 0.02, taker: 0.055}
   hyperliquid: {maker: 0.015, taker: 0.045}
-  aster: {maker: 0.01, taker: 0.035}
-  ondo: {maker: 0.01, taker: 0.025}
+  aster: {maker: 0, taker: 0.04, stock: {maker: 0, taker: 0.0125}}       # 官方文档：加密币 0/0.04，股票 0/0.0125
+  ondo: {maker: 0.02, taker: 0.05}           # 接口读不到时才用（接口给的是每个合约自己的费率）
+# 个别标的强制费率（优先级最高），例如：
+# fee_overrides: {aster: {XMR: {maker: 0, taker: 0.1}}}
+fee_overrides: {}
