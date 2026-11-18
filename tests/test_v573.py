@@ -32,7 +32,7 @@ def test_unified_balance_from_spot(mode):
     dex = {"marginSummary": {"accountValue": "0"}, "withdrawable": "0",
            "assetPositions": [{"position": {"coin": "io:ANTH", "unrealizedPnl": "-1.5"}}]}
     b = asyncio.run(_venue(mode, dex, SPOT).balance())
-    assert b.available == D("800.0") and b.equity == D("999.0")
+    assert b.available == D("800.0") and b.equity == D("1000.5")  # v5.9.2: uPnL is inside the spot total
 
 
 @pytest.mark.parametrize("mode", ["default", "disabled", "dexAbstraction"])

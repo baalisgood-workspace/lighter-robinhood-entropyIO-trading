@@ -208,8 +208,9 @@ class EntropyVenue(Venue):
             spot = await self._info({"type": "spotClearinghouseState", "user": self.address}, cost=2)
             row = next((b for b in spot.get("balances") or [] if b.get("token") == self._collateral_token), None) or {}
             total, hold = D(row.get("total") or 0), D(row.get("hold") or 0)
-            upnl = sum((D((ap.get("position") or {}).get("unrealizedPnl") or 0) for ap in st.get("assetPositions") or []), D(0))
-            return Balance(self.name, equity=total + upnl, available=max(D(0), total - hold))
+            # v5.9.2: the spot total already includes the open positions' unrealized PnL (its hold equals the
+            # dex accountValue = margin + uPnL, and it moves with the mark price); adding uPnL again counted it twice
+            return Balance(self.name, equity=total, available=max(D(0), total - hold))
         ms = st.get("marginSummary") or {}
         equity = D(ms.get("accountValue") or 0)
         if equity == 0 and not self._dex_empty_warned:
