@@ -361,7 +361,11 @@ async def _accept_flat(cfg: AppConfig, confirm: bool) -> int:
     try:
         for n in (pair.maker, pair.taker):
             v = build_venue(cfg.venues[n])
-            await v.start(cfg.symbols_for_venue(n), trading=False)
+            # v5.9.5: also load symbols that are disabled in the config but still have open grids (e.g. a market
+            # removed after a stock split), so their venue position is really checked instead of read as flat
+            grid_syms = {cfg.symbols[sp.symbol].venues[n] for sp in open_sps
+                         if sp.symbol in cfg.symbols and n in cfg.symbols[sp.symbol].venues}
+            await v.start(sorted(set(cfg.symbols_for_venue(n)) | grid_syms), trading=False)
             venues[n] = v
             actual[n] = await v.positions()
     finally:

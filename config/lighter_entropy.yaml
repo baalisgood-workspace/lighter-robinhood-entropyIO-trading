@@ -93,6 +93,9 @@ symbols:
     strategy: {initial_threshold_pct: 0.08, grid_value_usdc: 500, order_value_usdc: 250, max_grids: 2}
     risk: {max_symbol_value_usdc: 1000}
   SNDK:
+    # 2026-11-19 SNDK 1 拆 8：Lighter 把 SNDK 市场关闭（inactive）并按约 775.4 结算了全部仓位，Entropy 仍在交易。
+    # 停用到 Lighter 重新上线拆分后的 SNDK 为止（重新上线后核对两边价格单位一致再打开）
+    enabled: false
     venues: {lighter: SNDK, entropy: "io:SNDK"}
     strategy: {session: us_equity, initial_threshold_pct: 0.10, offhours_threshold_pct: 0.15, grid_value_usdc: 600, order_value_usdc: 300}
     risk: {max_symbol_value_usdc: 600}
